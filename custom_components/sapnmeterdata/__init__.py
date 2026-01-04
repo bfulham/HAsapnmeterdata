@@ -9,14 +9,14 @@ from .const import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
-def async_setup_entry(
+async def async_setup_entry(
     hass: core.HomeAssistant, entry: config_entries.ConfigEntry
 ) -> bool:
     """Set up platform from a ConfigEntry."""
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][entry.entry_id] = entry.data
-    entry.login = sapnmeterdata.login(entry.data["email"], entry.data["password"])
-    entry.meter = sapnmeterdata.meter(entry.data["id"], entry.login)
+    entry.login = hass.async_add_executor_job(sapnmeterdata.login, entry.data["email"], entry.data["password"])
+    entry.meter = hass.async_add_executor_job(sapnmeterdata.meter, entry.data["id"], entry.login)
 
     # Forward the setup to the sensor platform.
     hass.async_create_task(

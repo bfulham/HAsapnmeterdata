@@ -27,7 +27,7 @@ async def validate_host(email: cv.string, password: cv.string, hass: core.HomeAs
     except LoginError:
         raise ConnectionError("Invalid email or password")
     except Exception as e:
-        raise ConnectionError(f"An error occurred: {e}")
+        raise ConnectionError(f"An unknown error occurred: {e}")
 
 class SAPNMeterDataConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     data: Optional[Dict[str, Any]]

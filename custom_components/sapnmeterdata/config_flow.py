@@ -18,7 +18,7 @@ class LoginError(Exception):
         super().__init__(self.message)
     pass
 
-def validate_host(email: cv.string, password: cv.string, hass: core.HomeAssistant):
+async def validate_host(email: cv.string, password: cv.string, hass: core.HomeAssistant):
     """Validates a GitHub access token.
     Raises a ValueError if the auth token is invalid.
     """
@@ -28,7 +28,6 @@ def validate_host(email: cv.string, password: cv.string, hass: core.HomeAssistan
         raise ConnectionError("Invalid email or password")
     except Exception as e:
         raise ConnectionError(f"An unknown error occurred: {e}")
-    return True
 
 class SAPNMeterDataConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     data: Optional[Dict[str, Any]]
@@ -37,7 +36,7 @@ class SAPNMeterDataConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         errors: Dict[str, str] = {}
         if user_input is not None:
             try:
-                test = validate_host(user_input[CONF_EMAIL], user_input[CONF_PASSWORD], self.hass)
+                await self.hass.async_add_executor_job(validate_host, user_input[CONF_EMAIL], user_input[CONF_PASSWORD], self.hass)
             except ConnectionError as e:
                 errors["base"] = str(e)
             if not errors:

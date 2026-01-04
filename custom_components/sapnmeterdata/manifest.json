@@ -1,0 +1,13 @@
+{
+  "domain": "sapnmeterdata",
+  "name": "SA Power Networks Meter Data",
+  "codeowners": ["bfulham"],
+  "dependencies": [],
+  "config_flow": true,
+  "documentation": "https://github.com/bfulham/HAsapnmeterdata",
+  "integration_type": "device",
+  "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/bfulham/HAsapnmeterdata/issues",
+  "requirements": ["sapnmeterdata==0.0.4"],
+  "version": "0.0.1"
+}

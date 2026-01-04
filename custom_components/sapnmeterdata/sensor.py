@@ -27,6 +27,11 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend({
     vol.Required(CONF_ID): cv.positive_int,
 })
 
+def getdata(meter, path):
+    """Get data from SAPN meter."""
+    data = meter.getdata(path)
+    return data
+
 async def async_setup_entry(
     hass: core.HomeAssistant,
     config_entry: config_entries.ConfigEntry,
@@ -37,7 +42,7 @@ async def async_setup_entry(
     config = hass.data[DOMAIN][config_entry.entry_id]
     _LOGGER.info(pformat(config))
 
-    sensors = hass.async_add_executor_job(config_entry.meter.getdata, "/config/custom_components/sapnmeterdata/data")[1][0][1].columns.tolist()
+    sensors = hass.async_add_executor_job(getdata, config_entry.meter, "/config/custom_components/sapnmeterdata/data")[1][0][1].columns.tolist()
     for sensor in sensors:
         if sensor not in KNOWN_COLUMNS:
             async_add_entities([SAPNmeterdata(sensor, config_entry)])

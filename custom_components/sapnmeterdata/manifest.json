@@ -9,5 +9,5 @@
   "iot_class": "cloud_polling",
   "issue_tracker": "https://github.com/bfulham/HAsapnmeterdata/issues",
   "requirements": ["sapnmeterdata==0.0.4"],
-  "version": "0.0.8"
+  "version": "0.0.9"
 }

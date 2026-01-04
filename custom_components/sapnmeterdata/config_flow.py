@@ -37,8 +37,8 @@ class SAPNMeterDataConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             try:
                 await validate_host(user_input[CONF_EMAIL], user_input[CONF_PASSWORD], self.hass)
-            except ConnectionError:
-                errors["base"] = "Invalid email or password"
+            except ConnectionError as e:
+                errors["base"] = str(e)
             if not errors:
                 # Input is valid, set data.
                 self.data = user_input

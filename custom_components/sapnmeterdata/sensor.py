@@ -42,8 +42,8 @@ async def async_setup_entry(
     config = hass.data[DOMAIN][config_entry.entry_id]
     _LOGGER.info(pformat(config))
 
-    sensors = hass.async_add_executor_job(getdata, config_entry.meter, "/config/custom_components/sapnmeterdata/data")[1][0][1].columns.tolist()
-    for sensor in sensors:
+    sensors = hass.async_add_executor_job(getdata, config_entry.meter, "/config/custom_components/sapnmeterdata/data")
+    for sensor in sensors[1][0][1].columns.tolist():
         if sensor not in KNOWN_COLUMNS:
             async_add_entities([SAPNmeterdata(sensor, config_entry)])
                 

@@ -11,14 +11,23 @@ from homeassistant.helpers.entity_registry import (
 import socket
 import sapnmeterdata
 
+class LoginError(Exception):
+    """Raised when login fails."""
+    def __init__(self, message):
+        self.message = message
+        super().__init__(self.message)
+    pass
+
 async def validate_host(email: cv.string, password: cv.string, hass: core.HomeAssistant):
     """Validates a GitHub access token.
     Raises a ValueError if the auth token is invalid.
     """
     try:
         sapnmeterdata.login(email, password)
-    except Exception:
+    except LoginError:
         raise ConnectionError("Invalid email or password")
+    except Exception as e:
+        raise ConnectionError(f"An error occurred: {e}")
 
 class SAPNMeterDataConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     data: Optional[Dict[str, Any]]

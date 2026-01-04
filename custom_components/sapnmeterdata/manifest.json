@@ -6,8 +6,8 @@
   "config_flow": true,
   "documentation": "https://github.com/bfulham/HAsapnmeterdata",
   "integration_type": "device",
-  "iot_class": "local_polling",
+  "iot_class": "cloud_polling",
   "issue_tracker": "https://github.com/bfulham/HAsapnmeterdata/issues",
   "requirements": ["sapnmeterdata==0.0.4"],
-  "version": "0.0.1"
+  "version": "0.0.2"
 }

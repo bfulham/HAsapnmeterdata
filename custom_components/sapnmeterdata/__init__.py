@@ -7,8 +7,6 @@ import sapnmeterdata
 
 from .const import DOMAIN
 
-PLATFORMS = [Platform.MEDIA_PLAYER]
-
 _LOGGER = logging.getLogger(__name__)
 
 async def async_setup_entry(

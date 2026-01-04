@@ -40,7 +40,7 @@ class SAPNMeterDataConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 vol.Required(CONF_NAME): cv.string,
                 vol.Required(CONF_EMAIL): cv.string,
                 vol.Required(CONF_PASSWORD): cv.string,
-                vol.Required(CONF_ID): cv.integer
+                vol.Required(CONF_ID): cv.positive_int,
             }), errors=errors
         )
     

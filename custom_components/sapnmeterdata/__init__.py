@@ -15,8 +15,8 @@ async def async_setup_entry(
     """Set up platform from a ConfigEntry."""
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][entry.entry_id] = entry.data
-    entry.login = hass.async_add_executor_job(sapnmeterdata.login, entry.data["email"], entry.data["password"])
-    entry.meter = hass.async_add_executor_job(sapnmeterdata.meter, entry.data["id"], entry.login)
+    entry.login = await hass.async_add_executor_job(sapnmeterdata.login, entry.data["email"], entry.data["password"])
+    entry.meter = await hass.async_add_executor_job(sapnmeterdata.meter, entry.data["id"], entry.login)
 
     # Forward the setup to the sensor platform.
     hass.async_create_task(

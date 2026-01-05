@@ -7,6 +7,7 @@ import voluptuous as vol
 import pandas as pd
 from datetime import datetime
 from .const import DOMAIN, MANUFACTURER, KNOWN_COLUMNS
+import os
 
 from pprint import pformat
 
@@ -27,9 +28,9 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend({
     vol.Required(CONF_ID): cv.positive_int,
 })
 
-def getdata(meter, path):
+async def getdata(meter, path, hass):
     """Get data from SAPN meter."""
-    data = meter.getdata(path)
+    data = await hass.async_add_executor_job(meter.getdata, path)
     return data
 
 async def async_setup_entry(
@@ -42,27 +43,29 @@ async def async_setup_entry(
     config = hass.data[DOMAIN][config_entry.entry_id]
     _LOGGER.info(pformat(config))
 
-    sensors = hass.async_add_executor_job(getdata, config_entry.meter, "/config/custom_components/sapnmeterdata/data")
+    sensors = await getdata(config_entry.meter, "/config/custom_components/sapnmeterdata/data", hass)
     for sensor in sensors[1][0][1].columns.tolist():
         if sensor not in KNOWN_COLUMNS:
-            async_add_entities([SAPNmeterdata(sensor, config_entry)])
+            async_add_entities([SAPNmeterdata(sensor, config_entry, hass)])
                 
 
 class SAPNmeterdata(SensorEntity):
     """Representation of a SAPN meter."""
 
-    def __init__(self, sensor, config_entry, location = "") -> None:
+    def __init__(self, sensor, config_entry, hass) -> None:
         """Initialize a SAPN meter."""
-        self._sensor = config_entry.meter
+        self._hass = hass
+        self._meter = config_entry.meter
         self._device_name = config_entry.data["name"]
         self._name = config_entry.data["name"] + " " + sensor
         self._sensor_name = sensor
         self._manufacturer = MANUFACTURER
-        self._serialnumber = self._sensor.data["Serial Number"]
+        self._serialnumber = config_entry.data["id"]
         self._unique_id = self._serialnumber
-        self._device_class = SensorDeviceClass.TEMPERATURE
-        self._state_class = SensorStateClass.MEASUREMENT
-        self._unit = "°C"
+        self._device_class = SensorDeviceClass.ENERGY
+        self._state_class = SensorStateClass.TOTAL_INCREASING
+        self._unit = "kWh"
+        self._state = None
 
 
     @property
@@ -86,10 +89,7 @@ class SAPNmeterdata(SensorEntity):
     
     @property
     def state(self):
-        if self._sensor_name == "Build date":
-            return datetime.strptime(self._state, "%b %d %Y")
-        else:
-            return self._state
+        return self._state
     
     @property
     def state_class(self) -> SensorStateClass:
@@ -109,7 +109,9 @@ class SAPNmeterdata(SensorEntity):
 
     async def async_update(self) -> None:
         """Fetch new state data for this display."""
-        if self._location == "":
-            self._state = self._sensor.data[self._sensor_name]
-        else:
-            self._state = self._sensor.data[self._location][self._sensor_name]
+        data = await getdata(self._meter, f"\\config\\custom_components\\sapnmeterdata\\data\\{self._sensor_name}\\", self._hass)
+        os.remove(data[0])
+        _LOGGER.debug(pformat(data[0]))
+        data = data[1][0][1].drop(columns=['t_start', 'quality_method', 'evt_code', 'evt_desc'])
+        data['datetime'] = data['t_end']
+        _LOGGER.info(pformat(data))

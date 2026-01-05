@@ -28,9 +28,9 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend({
     vol.Required(CONF_ID): cv.positive_int,
 })
 
-async def getdata(meter, path, hass):
+async def getdata(meter, hass):
     """Get data from SAPN meter."""
-    data = await hass.async_add_executor_job(meter.getdata, path)
+    data = await hass.async_add_executor_job(meter.getdata)
     return data
 
 async def async_setup_entry(
@@ -43,10 +43,9 @@ async def async_setup_entry(
     config = hass.data[DOMAIN][config_entry.entry_id]
     _LOGGER.info(pformat(config))
 
-    sensors = await getdata(config_entry.meter, "/config/custom_components/sapnmeterdata/data", hass)
-    for sensor in sensors[1][0][1].columns.tolist():
-        if sensor not in KNOWN_COLUMNS:
-            async_add_entities([SAPNmeterdata(sensor, config_entry, hass)])
+    sensors = await getdata(config_entry.meter, hass)
+    for sensor in sensors.columns.get_level_values(1).tolist():
+        async_add_entities([SAPNmeterdata(sensor, config_entry, hass)])
                 
 
 class SAPNmeterdata(SensorEntity):
@@ -109,9 +108,7 @@ class SAPNmeterdata(SensorEntity):
 
     async def async_update(self) -> None:
         """Fetch new state data for this display."""
-        data = await getdata(self._meter, f"\\config\\custom_components\\sapnmeterdata\\data\\{self._sensor_name}\\", self._hass)
-        os.remove(data[0])
-        _LOGGER.debug(pformat(data[0]))
-        data = data[1][0][1].drop(columns=['t_start', 'quality_method', 'evt_code', 'evt_desc'])
-        data['datetime'] = data['t_end']
-        _LOGGER.info(pformat(data))
+        data = await getdata(self._meter, self._hass)
+        _LOGGER.debug(pformat(data))
+        _LOGGER.debug("Updating sensor %s to %s", self._sensor_name, data[(self._meter.nmi, self._sensor_name)].iloc[-1])
+        self._state = data[(self._meter.nmi, self._sensor_name)].iloc[-1]

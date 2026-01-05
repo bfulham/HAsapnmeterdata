@@ -8,6 +8,6 @@
   "integration_type": "device",
   "iot_class": "cloud_polling",
   "issue_tracker": "https://github.com/bfulham/HAsapnmeterdata/issues",
-  "requirements": ["sapnmeterdata==0.1.0"],
-  "version": "0.1.1"
+  "requirements": ["sapnmeterdata==0.1.1"],
+  "version": "0.1.2"
 }

@@ -1,0 +1,19 @@
+{
+  "domain": "sapnmeterdata",
+  "name": "SA Power Networks Meter Data",
+  "codeowners": [
+    "@bfulham"
+  ],
+  "config_flow": true,
+  "dependencies": [
+    "recorder"
+  ],
+  "documentation": "https://github.com/bfulham/HAsapnmeterdata",
+  "integration_type": "service",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/bfulham/HAsapnmeterdata/issues",
+  "requirements": [
+    "sapnmeterdata==0.3.0"
+  ],
+  "version": "0.2.0"
+}

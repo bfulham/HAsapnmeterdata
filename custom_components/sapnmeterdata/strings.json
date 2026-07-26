@@ -1,0 +1,89 @@
+{
+  "title": "SA Power Networks Meter Data",
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to SA Power Networks",
+        "description": "Sign in to the SAPN meter-data portal. Credentials are stored by Home Assistant and sent only to SAPN.",
+        "data": {
+          "email": "Email",
+          "password": "Password"
+        }
+      },
+      "meters": {
+        "title": "Choose meters and channels",
+        "description": "Select the NMIs to import. SAPN commonly uses E channels for grid consumption and B channels for return to grid. Multiple patterns can be separated with commas.",
+        "data": {
+          "nmis": "NMIs",
+          "consumption_channels": "Grid consumption channel patterns",
+          "return_channels": "Return-to-grid channel patterns"
+        },
+        "data_description": {
+          "consumption_channels": "Default: E* (for example E1 and E2)",
+          "return_channels": "Default: B* (for example B1)"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Reconnect to SA Power Networks",
+        "description": "Enter the current password for {email}.",
+        "data": {
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Could not connect to the SAPN portal.",
+      "invalid_auth": "The SAPN credentials were rejected.",
+      "no_nmis": "No NMIs were assigned to this SAPN account.",
+      "select_nmi": "Select at least one NMI.",
+      "unknown": "Unexpected error."
+    },
+    "abort": {
+      "already_configured": "This SAPN account is already configured.",
+      "reauth_successful": "SAPN authentication was updated."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "SA Power Networks Meter Data options",
+        "description": "Choose which NMIs and NEM12 channel patterns are imported.",
+        "data": {
+          "nmis": "NMIs",
+          "consumption_channels": "Grid consumption channel patterns",
+          "return_channels": "Return-to-grid channel patterns"
+        },
+        "data_description": {
+          "consumption_channels": "Default: E* (for example E1 and E2)",
+          "return_channels": "Default: B* (for example B1)"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Could not refresh the NMIs from the SAPN portal. Saved NMIs are still available.",
+      "invalid_auth": "The SAPN credentials were rejected.",
+      "select_nmi": "Select at least one NMI.",
+      "unknown": "Unexpected error while refreshing NMIs."
+    }
+  },
+  "entity": {
+    "sensor": {
+      "import_status": {
+        "name": "Import status",
+        "state": {
+          "up_to_date": "Up to date",
+          "imported": "Imported",
+          "partial": "Partially imported",
+          "waiting_for_data": "Waiting for SAPN data",
+          "attention": "Attention needed"
+        }
+      }
+    },
+    "button": {
+      "import_previous_day": {
+        "name": "Import previous day"
+      }
+    }
+  }
+}
+

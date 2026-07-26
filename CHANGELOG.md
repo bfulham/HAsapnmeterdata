@@ -1,0 +1,16 @@
+# Changelog
+
+## 0.2.0
+
+- Import historical SAPN readings into Home Assistant Recorder statistics.
+- Add Energy Dashboard grid-consumption and return-to-grid statistics.
+- Support multiple NMIs per config entry.
+- Aggregate NEM12 five-minute intervals into local hourly statistics.
+- Handle Adelaide daylight-saving transition days.
+- Wait until SAPN's 3:00 am Adelaide publication time.
+- Schedule a dedicated daily import at 3:05 am Adelaide time.
+- Retry delayed data every three hours.
+- Skip unavailable NMIs without blocking successful meters.
+- Migrate existing 0.1.x single-NMI config entries.
+- Update the client dependency to `sapnmeterdata==0.3.0`.
+

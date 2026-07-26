@@ -1,0 +1,37 @@
+"""Constants for the SA Power Networks Meter Data integration."""
+
+import logging
+from datetime import time, timedelta
+
+DOMAIN = "sapnmeterdata"
+LOGGER = logging.getLogger(__package__)
+MANUFACTURER = "SA Power Networks"
+
+CONF_AVAILABLE_NMIS = "available_nmis"
+CONF_NMIS = "nmis"
+CONF_CONSUMPTION_CHANNELS = "consumption_channels"
+CONF_RETURN_CHANNELS = "return_channels"
+
+DEFAULT_CONSUMPTION_CHANNELS = "E*"
+DEFAULT_RETURN_CHANNELS = "B*"
+SAPN_TIME_ZONE = "Australia/Adelaide"
+
+# SAPN publishes the completed previous day at 03:00 Adelaide time. Schedule
+# five minutes later to avoid racing the portal's refresh.
+DATA_AVAILABLE_TIME = time(hour=3)
+DAILY_REFRESH_TIME = time(hour=3, minute=5)
+UPDATE_INTERVAL = timedelta(hours=3)
+STORE_VERSION = 1
+
+STATUS_UP_TO_DATE = "up_to_date"
+STATUS_IMPORTED = "imported"
+STATUS_PARTIAL = "partial"
+STATUS_WAITING = "waiting_for_data"
+STATUS_ATTENTION = "attention"
+STATUS_OPTIONS = [
+    STATUS_UP_TO_DATE,
+    STATUS_IMPORTED,
+    STATUS_PARTIAL,
+    STATUS_WAITING,
+    STATUS_ATTENTION,
+]

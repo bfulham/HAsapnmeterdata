@@ -7,11 +7,11 @@ ROOT = Path(__file__).parents[1]
 INTEGRATION = ROOT / "custom_components" / "sapnmeterdata"
 
 
-def test_manifest_is_the_compatible_022_update() -> None:
+def test_manifest_is_the_compatible_023_update() -> None:
     """The release preserves the domain and pins the tested portal client."""
     manifest = json.loads((INTEGRATION / "manifest.json").read_text())
     assert manifest["domain"] == "sapnmeterdata"
-    assert manifest["version"] == "0.2.2"
+    assert manifest["version"] == "0.2.3"
     assert manifest["config_flow"] is True
     assert "recorder" in manifest["dependencies"]
     assert manifest["requirements"] == ["sapnmeterdata==0.3.2"]
@@ -47,3 +47,25 @@ def test_opening_config_flow_does_not_import_the_data_stack() -> None:
     assert "from .coordinator import" not in setup_prefix
     assert "from sapnmeterdata import" not in coordinator_prefix
     assert "import pandas" not in coordinator_prefix
+
+
+def test_historical_backfill_is_exposed_and_chunked() -> None:
+    """The UI starts a resumable bounded historical import."""
+    button = (INTEGRATION / "button.py").read_text()
+    coordinator = (INTEGRATION / "coordinator.py").read_text()
+    constants = (INTEGRATION / "const.py").read_text()
+
+    assert "update_historical_data" in button
+    assert "async_start_historical_backfill" in coordinator
+    assert "HISTORICAL_CHUNK_DAYS = 7" in constants
+    assert "HISTORICAL_CHUNK_DELAY" in coordinator
+
+
+def test_alignment_migration_replaces_old_statistics() -> None:
+    """Version 0.2.3 clears the half-hour-shifted 0.2.2 rows."""
+    coordinator = (INTEGRATION / "coordinator.py").read_text()
+    transform = (INTEGRATION / "transform.py").read_text()
+
+    assert "clear_statistics" in coordinator
+    assert "STATISTICS_ALIGNMENT_VERSION" in coordinator
+    assert "tz_convert(UTC)" in transform

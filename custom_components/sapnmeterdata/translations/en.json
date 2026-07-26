@@ -75,15 +75,18 @@
           "imported": "Imported",
           "partial": "Partially imported",
           "waiting_for_data": "Waiting for SAPN data",
-          "attention": "Attention needed"
+          "attention": "Attention needed",
+          "backfilling_history": "Updating historical data"
         }
       }
     },
     "button": {
       "import_previous_day": {
         "name": "Import previous day"
+      },
+      "update_historical_data": {
+        "name": "Update historical data"
       }
     }
   }
 }
-

@@ -31,3 +31,35 @@ def next_daily_refresh(
             timezone,
         )
     return candidate.astimezone(UTC)
+
+
+def utc_statistic_window(
+    start_date: date,
+    end_date: date,
+    timezone_name: str,
+) -> tuple[datetime, datetime]:
+    """Return UTC-hour boundaries covering a local calendar-date range."""
+    if end_date <= start_date:
+        raise ValueError("end_date must be after start_date")
+
+    timezone = ZoneInfo(timezone_name)
+    local_start = datetime.combine(start_date, time.min, timezone)
+    local_end = datetime.combine(end_date, time.min, timezone)
+    start_utc = local_start.astimezone(UTC).replace(
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    end_utc = local_end.astimezone(UTC).replace(
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    return start_utc, end_utc
+
+
+def historical_chunk(before: date, days: int) -> tuple[date, date]:
+    """Return one backwards date chunk ending before ``before``."""
+    if days < 1:
+        raise ValueError("days must be at least one")
+    return before - timedelta(days=days), before

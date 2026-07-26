@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.3
+
+- Align external statistics to UTC hour boundaries so SAPN grid and
+  return-to-grid readings share Energy Dashboard bars with Home Assistant's
+  native solar statistics.
+- Automatically replace the half-hour-shifted rows written by versions
+  0.2.0–0.2.2 while preserving the existing statistic IDs.
+- Store each hourly interval as the statistic state and maintain its continuous
+  cumulative sum.
+- Add an **Update historical data** button.
+- Backfill each NMI in rate-limited seven-day chunks, persist progress across
+  restarts, and stop separately when SAPN has no older data.
+- Keep current daily imports ahead of historical backfill work.
+
 ## 0.2.2
 
 - Use `sapnmeterdata==0.3.2`, which replaces the native Polars parser with the

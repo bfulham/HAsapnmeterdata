@@ -1,32 +1,16 @@
-"""Pure data transformation and scheduling helpers for SAPN meter data."""
+"""Pandas transformations for SA Power Networks interval data."""
 
 from __future__ import annotations
 
 import fnmatch
 import math
 import re
-from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
-from datetime import datetime, timedelta
-from typing import Any
+from collections.abc import Iterable
+from datetime import UTC, datetime
 
 import pandas as pd
 
-
-@dataclass(frozen=True, slots=True)
-class HourlyPoint:
-    """Energy recorded during one local clock hour."""
-
-    start: datetime
-    value: float
-
-
-@dataclass(frozen=True, slots=True)
-class HourlyStream:
-    """An hourly energy stream and the channels that contributed to it."""
-
-    points: tuple[HourlyPoint, ...]
-    channels: tuple[str, ...]
+from .statistics import HourlyPoint, HourlyStream
 
 
 def parse_patterns(value: str | Iterable[str]) -> tuple[str, ...]:
@@ -56,8 +40,10 @@ def _channel_series(
 def _hourly_points(
     series: pd.Series,
     timezone_name: str,
+    window_start: datetime | None,
+    window_end: datetime | None,
 ) -> tuple[HourlyPoint, ...]:
-    """Localize SAPN timestamps and aggregate interval energy by local hour."""
+    """Aggregate intervals into Home Assistant's UTC-aligned hours."""
     index = pd.DatetimeIndex(pd.to_datetime(series.index))
     if index.tz is None:
         index = index.tz_localize(
@@ -68,15 +54,14 @@ def _hourly_points(
     else:
         index = index.tz_convert(timezone_name)
 
-    normalized = pd.Series(series.to_numpy(), index=index)
-    # DatetimeIndex.floor() cannot reliably infer all repeated timestamps in
-    # Adelaide's 25-hour DST day. Python datetimes retain their ``fold`` value,
-    # so replacing the sub-hour fields preserves both distinct 02:00 hours.
-    hour_index = pd.DatetimeIndex(
-        timestamp.to_pydatetime().replace(minute=0, second=0, microsecond=0)
-        for timestamp in normalized.index
-    )
-    hourly = normalized.groupby(hour_index).sum(min_count=1).dropna()
+    utc_index = index.tz_convert(UTC)
+    normalized = pd.Series(series.to_numpy(), index=utc_index)
+    hourly = normalized.groupby(utc_index.floor("h")).sum(min_count=1).dropna()
+
+    if window_start is not None:
+        hourly = hourly.loc[hourly.index >= pd.Timestamp(window_start)]
+    if window_end is not None:
+        hourly = hourly.loc[hourly.index < pd.Timestamp(window_end)]
 
     return tuple(
         HourlyPoint(
@@ -94,8 +79,10 @@ def extract_hourly_streams(
     consumption_patterns: str | Iterable[str],
     return_patterns: str | Iterable[str],
     timezone_name: str,
+    window_start: datetime | None = None,
+    window_end: datetime | None = None,
 ) -> dict[str, HourlyStream]:
-    """Extract consumption and return-to-grid hourly streams for one NMI."""
+    """Extract UTC-hour consumption and return-to-grid streams for one NMI."""
     if frame.empty:
         return {}
     if not isinstance(frame.columns, pd.MultiIndex) or frame.columns.nlevels < 2:
@@ -122,103 +109,9 @@ def extract_hourly_streams(
         points = _hourly_points(
             _channel_series(by_channel, channels),
             timezone_name,
+            window_start,
+            window_end,
         )
         if points:
             streams[direction] = HourlyStream(points=points, channels=channels)
     return streams
-
-
-def statistic_id(nmi: str, direction: str) -> str:
-    """Return a stable Home Assistant external statistic ID."""
-    safe_nmi = re.sub(r"[^a-z0-9_]", "_", str(nmi).lower()).strip("_")
-    return f"sapnmeterdata:{safe_nmi}_{direction}"
-
-
-def statistic_name(nmi: str, direction: str) -> str:
-    """Return a user-facing statistic name."""
-    label = "Grid consumption" if direction == "consumption" else "Return to grid"
-    return f"SAPN {nmi} {label}"
-
-
-def _row_timestamp(row: Mapping[str, Any]) -> float | None:
-    """Return a statistics row timestamp in Unix seconds."""
-    value = row.get("start")
-    if isinstance(value, datetime):
-        return value.timestamp()
-    if isinstance(value, (int, float)):
-        return float(value)
-    return None
-
-
-def derive_base_sum(
-    points: Iterable[HourlyPoint],
-    existing_rows: Iterable[Mapping[str, Any]],
-    last_rows: Iterable[Mapping[str, Any]],
-) -> tuple[float, bool]:
-    """Find the cumulative sum immediately before the first hourly point.
-
-    Existing rows in the target period make repeated imports deterministic.
-    Otherwise, the most recent cumulative sum continues the statistic. A brand
-    new stream starts at zero and requests a baseline row.
-    """
-    point_list = tuple(points)
-    cumulative = 0.0
-    existing = tuple(existing_rows)
-    for point in point_list:
-        cumulative += point.value
-        point_timestamp = point.start.timestamp()
-        for row in existing:
-            row_timestamp = _row_timestamp(row)
-            row_sum = row.get("sum")
-            if (
-                row_timestamp is not None
-                and abs(row_timestamp - point_timestamp) < 0.5
-                and isinstance(row_sum, (int, float))
-            ):
-                return float(row_sum) - cumulative, False
-
-    usable_last_rows = [
-        row
-        for row in last_rows
-        if _row_timestamp(row) is not None and isinstance(row.get("sum"), (int, float))
-    ]
-    if usable_last_rows:
-        latest = max(usable_last_rows, key=lambda row: _row_timestamp(row) or 0.0)
-        return float(latest["sum"]), False
-
-    return 0.0, True
-
-
-def build_statistics(
-    points: Iterable[HourlyPoint],
-    base_sum: float,
-    include_baseline: bool,
-) -> list[dict[str, Any]]:
-    """Build cumulative Home Assistant statistics rows."""
-    point_list = tuple(points)
-    if not point_list:
-        return []
-
-    rows: list[dict[str, Any]] = []
-    if include_baseline:
-        rows.append(
-            {
-                "start": point_list[0].start - timedelta(hours=1),
-                "state": float(base_sum),
-                "sum": float(base_sum),
-                "last_reset": None,
-            }
-        )
-
-    running_sum = float(base_sum)
-    for point in point_list:
-        running_sum += point.value
-        rows.append(
-            {
-                "start": point.start,
-                "state": running_sum,
-                "sum": running_sum,
-                "last_reset": None,
-            }
-        )
-    return rows

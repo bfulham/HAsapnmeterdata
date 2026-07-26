@@ -8,19 +8,26 @@ selected directly in the Energy Dashboard.
 This integration uses
 [`sapnmeterdata`](https://pypi.org/project/sapnmeterdata/) 0.3.2.
 
-Version 0.2.2 uses `sapnmeterdata` 0.3.2, which removes the native Polars
-runtime and keeps all data-stack imports out of the config-flow startup path.
-This supports older Home Assistant processors while retaining compatibility
-with Home Assistant's pinned pandas 2.3.3 installation.
+Version 0.2.3 aligns SAPN readings to Home Assistant's UTC statistics hours and
+adds a resumable historical import. It continues to use `sapnmeterdata` 0.3.2,
+which avoids a native Polars runtime and is compatible with Home Assistant's
+pinned pandas installation.
 
-## Version 0.2.0
+## Upgrading to 0.2.3
 
-Version 0.2.0 replaces the original current-value sensors with historical
-Recorder statistics suitable for the Energy Dashboard.
+Versions 0.2.0–0.2.2 wrote Adelaide clock-hour timestamps. Adelaide's
+half-hour UTC offset meant those readings did not line up with Home Assistant's
+native solar statistics, causing grid and consumed-solar bars to alternate.
 
-Existing 0.1.x config entries are migrated automatically. Each old entry keeps
-its configured email, password, and NMI. Open **Configure** afterward to refresh
-the account's NMI list and select additional meters.
+On its first start, 0.2.3 automatically removes those misaligned SAPN rows and
+reimports the latest available day on UTC hour boundaries. The statistic IDs do
+not change, so existing Energy Dashboard selections are preserved. Use the
+**Update historical data** button afterward to restore all older available
+history in the corrected format.
+
+Existing 0.1.x config entries are also migrated automatically. Each old entry
+keeps its configured email, password, and NMI. Open **Configure** afterward to
+refresh the account's NMI list and select additional meters.
 
 ## What it does
 
@@ -31,9 +38,12 @@ the account's NMI list and select additional meters.
   - `B*` is return to grid by default.
 - Aggregates five-minute readings into Home Assistant's required hourly
   external statistics, including 23- and 25-hour daylight-saving days.
+- Aligns every imported row to Home Assistant's UTC hour boundaries so grid,
+  solar, and return-to-grid values share the same Energy Dashboard bars.
 - Maintains continuous cumulative kWh totals for Energy Dashboard reporting.
 - Retries delayed data without creating duplicate rows.
 - Catches up one day at a time after Home Assistant has been offline.
+- Backfills older portal history in bounded, resumable seven-day chunks.
 
 SAPN's portal is not a documented public API, so portal changes can temporarily
 break data retrieval.
@@ -109,6 +119,26 @@ blocked.
 The **Import previous day** button requests an immediate check. Before 3:00 am
 it still respects SAPN's availability cutoff and will not request yesterday
 early.
+
+### Historical import
+
+Press **Update historical data** once to import everything the SAPN portal
+makes available before the integration's earliest recorded day.
+
+- Each NMI is requested in seven-day chunks rather than one multi-year
+  download.
+- Successful chunks are separated by one minute to limit portal load.
+- Daily forward imports remain the priority.
+- Progress is saved after every chunk and resumes after a Home Assistant
+  restart.
+- Importing stops separately for each NMI when SAPN reports that no older data
+  is available.
+- A failed NMI is paused rather than retried continuously. Press the button
+  again to clear failed markers and retry from its saved checkpoint.
+
+The **Import status** sensor shows `Updating historical data` while work
+remains. Its `historical_backfill` attribute contains each NMI's checkpoint,
+the completed and failed NMIs, and the number of imported chunks.
 
 ## Channel mapping
 

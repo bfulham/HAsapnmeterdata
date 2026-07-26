@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.2
+
+- Use `sapnmeterdata==0.3.2`, which replaces the native Polars parser with the
+  pandas-based `nemreader` 0.9.2 parser for older Home Assistant processors.
+- Avoid importing the SAPN client, pandas, and the NEM12 parser when the config
+  flow is opened.
+- Run portal imports, NEM12 parsing, and interval transformation in Home
+  Assistant's executor.
+
 ## 0.2.1
 
 - Use `sapnmeterdata==0.3.1`, which supports Home Assistant's pinned

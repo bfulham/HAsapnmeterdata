@@ -17,8 +17,6 @@ from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
 from homeassistant.core import callback
 from homeassistant.helpers import selector
 
-from sapnmeterdata import AuthError, FetchError, LoginError, login
-
 from .const import (
     CONF_AVAILABLE_NMIS,
     CONF_CONSUMPTION_CHANNELS,
@@ -32,9 +30,27 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 
+class InvalidAuthError(Exception):
+    """Credentials were rejected by the SAPN portal."""
+
+
+class CannotConnectError(Exception):
+    """The SAPN portal could not be reached or queried."""
+
+
 def _discover_nmis(email: str, password: str) -> list[str]:
     """Validate credentials and return assigned NMIs."""
-    return [str(nmi) for nmi in login(email, password).getNMIs()]
+    # This function always runs in Home Assistant's executor. Keeping the
+    # import here avoids importing pandas and the NEM12 parser on HA's event
+    # loop merely because the user opened the config flow.
+    from sapnmeterdata import AuthError, FetchError, LoginError, login
+
+    try:
+        return [str(nmi) for nmi in login(email, password).getNMIs()]
+    except (AuthError, LoginError) as err:
+        raise InvalidAuthError from err
+    except FetchError as err:
+        raise CannotConnectError from err
 
 
 def _credentials_schema() -> vol.Schema:
@@ -130,9 +146,9 @@ class SAPNMeterDataConfigFlow(ConfigFlow, domain=DOMAIN):
                     self._email,
                     self._password,
                 )
-            except (AuthError, LoginError):
+            except InvalidAuthError:
                 errors["base"] = "invalid_auth"
-            except FetchError:
+            except CannotConnectError:
                 errors["base"] = "cannot_connect"
             except Exception:
                 _LOGGER.exception("Unexpected error validating SAPN credentials")
@@ -209,9 +225,9 @@ class SAPNMeterDataConfigFlow(ConfigFlow, domain=DOMAIN):
                     email,
                     user_input[CONF_PASSWORD],
                 )
-            except (AuthError, LoginError):
+            except InvalidAuthError:
                 errors["base"] = "invalid_auth"
-            except FetchError:
+            except CannotConnectError:
                 errors["base"] = "cannot_connect"
             except Exception:
                 _LOGGER.exception("Unexpected error reauthenticating with SAPN")
@@ -265,9 +281,9 @@ class SAPNMeterDataOptionsFlow(OptionsFlow):
                     self.config_entry.data[CONF_EMAIL],
                     self.config_entry.data[CONF_PASSWORD],
                 )
-            except (AuthError, LoginError):
+            except InvalidAuthError:
                 errors["base"] = "invalid_auth"
-            except FetchError:
+            except CannotConnectError:
                 errors["base"] = "cannot_connect"
             except Exception:
                 _LOGGER.exception("Unexpected error refreshing SAPN NMIs")

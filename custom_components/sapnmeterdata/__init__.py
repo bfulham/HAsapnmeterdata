@@ -12,7 +12,6 @@ from .const import (
     DEFAULT_CONSUMPTION_CHANNELS,
     DEFAULT_RETURN_CHANNELS,
 )
-from .coordinator import SAPNMeterDataCoordinator
 
 PLATFORMS = [Platform.SENSOR, Platform.BUTTON]
 
@@ -45,6 +44,11 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up SA Power Networks Meter Data from a config entry."""
+    # Import only when an entry is being set up. Python imports this package
+    # before it opens config_flow.py, so a module-level coordinator import
+    # would otherwise load the complete data stack when the user clicks Add.
+    from .coordinator import SAPNMeterDataCoordinator
+
     coordinator = SAPNMeterDataCoordinator(hass, entry)
     await coordinator.async_config_entry_first_refresh()
     entry.runtime_data = coordinator

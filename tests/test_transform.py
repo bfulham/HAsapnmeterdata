@@ -12,6 +12,9 @@ import pytest
 MODULE_PATH = (
     Path(__file__).parents[1] / "custom_components" / "sapnmeterdata" / "transform.py"
 )
+SCHEDULE_MODULE_PATH = (
+    Path(__file__).parents[1] / "custom_components" / "sapnmeterdata" / "schedule.py"
+)
 SPEC = importlib.util.spec_from_file_location("sapn_transform", MODULE_PATH)
 assert SPEC is not None
 assert SPEC.loader is not None
@@ -19,12 +22,21 @@ transform = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = transform
 SPEC.loader.exec_module(transform)
 
+SCHEDULE_SPEC = importlib.util.spec_from_file_location(
+    "sapn_schedule",
+    SCHEDULE_MODULE_PATH,
+)
+assert SCHEDULE_SPEC is not None
+assert SCHEDULE_SPEC.loader is not None
+schedule = importlib.util.module_from_spec(SCHEDULE_SPEC)
+SCHEDULE_SPEC.loader.exec_module(schedule)
+
 HourlyPoint = transform.HourlyPoint
 build_statistics = transform.build_statistics
 derive_base_sum = transform.derive_base_sum
 extract_hourly_streams = transform.extract_hourly_streams
-latest_available_date = transform.latest_available_date
-next_daily_refresh = transform.next_daily_refresh
+latest_available_date = schedule.latest_available_date
+next_daily_refresh = schedule.next_daily_refresh
 parse_patterns = transform.parse_patterns
 statistic_id = transform.statistic_id
 

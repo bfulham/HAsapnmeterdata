@@ -7,7 +7,6 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any, override
 
-import pandas as pd
 from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.models import (
     StatisticData,
@@ -26,15 +25,6 @@ from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers import storage
 from homeassistant.helpers.event import async_track_point_in_utc_time
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
-
-from sapnmeterdata import (
-    AuthError,
-    FetchError,
-    LoginError,
-    NoDataError,
-    login,
-    meter,
-)
 
 from .const import (
     CONF_CONSUMPTION_CHANNELS,
@@ -55,23 +45,22 @@ from .const import (
     STORE_VERSION,
     UPDATE_INTERVAL,
 )
-from .transform import (
-    HourlyPoint,
-    build_statistics,
-    derive_base_sum,
-    extract_hourly_streams,
-    latest_available_date,
-    next_daily_refresh,
-    statistic_id,
-    statistic_name,
-)
+from .schedule import latest_available_date, next_daily_refresh
+
+
+class PortalAuthError(Exception):
+    """Authentication failed inside the blocking portal worker."""
+
+
+class PortalFetchError(Exception):
+    """A top-level portal operation failed inside the blocking worker."""
 
 
 @dataclass(slots=True)
 class FetchBatch:
     """Results from one blocking SAPN portal session."""
 
-    frames: dict[str, pd.DataFrame] = field(default_factory=dict)
+    streams: dict[str, dict[str, Any]] = field(default_factory=dict)
     no_data: dict[str, str] = field(default_factory=dict)
     errors: dict[str, str] = field(default_factory=dict)
 
@@ -80,19 +69,49 @@ def _fetch_meter_data(
     email: str,
     password: str,
     targets: dict[str, date],
+    consumption_channels: str,
+    return_channels: str,
 ) -> FetchBatch:
-    """Login once and fetch a calendar day for each pending NMI."""
-    client = login(email, password)
+    """Fetch and transform pending days without blocking HA's event loop."""
+    from sapnmeterdata import (
+        AuthError,
+        FetchError,
+        LoginError,
+        NoDataError,
+        login,
+        meter,
+    )
+
+    from .transform import extract_hourly_streams
+
+    try:
+        client = login(email, password)
+    except (AuthError, LoginError) as err:
+        raise PortalAuthError(str(err)) from err
+    except FetchError as err:
+        raise PortalFetchError(str(err)) from err
+
     result = FetchBatch()
     for nmi, target_date in targets.items():
         start = datetime.combine(target_date, time.min)
         end = start + timedelta(days=1)
         try:
-            result.frames[nmi] = meter(nmi, client).getdata(start, end)
+            frame = meter(nmi, client).getdata(start, end)
         except NoDataError as err:
             result.no_data[nmi] = str(err)
         except FetchError as err:
             result.errors[nmi] = str(err)
+        else:
+            try:
+                result.streams[nmi] = extract_hourly_streams(
+                    frame,
+                    nmi,
+                    consumption_channels,
+                    return_channels,
+                    SAPN_TIME_ZONE,
+                )
+            except (TypeError, ValueError) as err:
+                result.errors[nmi] = str(err)
     return result
 
 
@@ -185,7 +204,7 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def _async_existing_statistics(
         self,
         stat_id: str,
-        points: tuple[HourlyPoint, ...],
+        points: tuple[Any, ...],
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """Load rows needed to continue or deterministically replace a sum."""
         recorder = get_instance(self.hass)
@@ -216,9 +235,16 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self,
         nmi: str,
         direction: str,
-        points: tuple[HourlyPoint, ...],
+        points: tuple[Any, ...],
     ) -> str:
         """Import one consumption or return-to-grid stream."""
+        from .transform import (
+            build_statistics,
+            derive_base_sum,
+            statistic_id,
+            statistic_name,
+        )
+
         stat_id = statistic_id(nmi, direction)
         existing, last = await self._async_existing_statistics(stat_id, points)
         base_sum, include_baseline = derive_base_sum(points, existing, last)
@@ -277,10 +303,15 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 config[CONF_EMAIL],
                 config[CONF_PASSWORD],
                 targets,
+                config.get(
+                    CONF_CONSUMPTION_CHANNELS,
+                    DEFAULT_CONSUMPTION_CHANNELS,
+                ),
+                config.get(CONF_RETURN_CHANNELS, DEFAULT_RETURN_CHANNELS),
             )
-        except (AuthError, LoginError) as err:
+        except PortalAuthError as err:
             raise ConfigEntryAuthFailed(str(err)) from err
-        except FetchError as err:
+        except PortalFetchError as err:
             raise UpdateFailed(str(err)) from err
         except Exception as err:
             LOGGER.exception("Unexpected error while contacting SAPN")
@@ -307,39 +338,26 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             else:
                 waiting.append(nmi)
 
-        for nmi, frame in batch.frames.items():
-            try:
-                streams = extract_hourly_streams(
-                    frame,
-                    nmi,
-                    config.get(
-                        CONF_CONSUMPTION_CHANNELS,
-                        DEFAULT_CONSUMPTION_CHANNELS,
-                    ),
-                    config.get(CONF_RETURN_CHANNELS, DEFAULT_RETURN_CHANNELS),
-                    SAPN_TIME_ZONE,
+        for nmi, streams in batch.streams.items():
+            if not streams:
+                errors[nmi] = (
+                    "No channels matched the configured consumption or "
+                    "return-to-grid patterns."
                 )
-                if not streams:
-                    errors[nmi] = (
-                        "No channels matched the configured consumption or "
-                        "return-to-grid patterns."
-                    )
-                    continue
+                continue
 
-                channels[nmi] = {}
-                statistics[nmi] = {}
-                for direction, stream in streams.items():
-                    channels[nmi][direction] = list(stream.channels)
-                    statistics[nmi][direction] = await self._async_import_stream(
-                        nmi,
-                        direction,
-                        stream.points,
-                    )
-                    queued_statistics = True
-                imported.append(nmi)
-                last_processed[nmi] = targets[nmi].isoformat()
-            except (TypeError, ValueError) as err:
-                errors[nmi] = str(err)
+            channels[nmi] = {}
+            statistics[nmi] = {}
+            for direction, stream in streams.items():
+                channels[nmi][direction] = list(stream.channels)
+                statistics[nmi][direction] = await self._async_import_stream(
+                    nmi,
+                    direction,
+                    stream.points,
+                )
+                queued_statistics = True
+            imported.append(nmi)
+            last_processed[nmi] = targets[nmi].isoformat()
 
         if queued_statistics:
             await get_instance(self.hass).async_block_till_done()

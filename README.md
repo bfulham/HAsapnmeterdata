@@ -6,7 +6,10 @@ statistics. The resulting grid-consumption and return-to-grid statistics can be
 selected directly in the Energy Dashboard.
 
 This integration uses
-[`sapnmeterdata`](https://pypi.org/project/sapnmeterdata/) 0.3.0.
+[`sapnmeterdata`](https://pypi.org/project/sapnmeterdata/) 0.3.1.
+
+Version 0.2.1 widens the client library's pandas compatibility so it can use
+Home Assistant's pinned pandas 2.3.3 installation.
 
 ## Version 0.2.0
 

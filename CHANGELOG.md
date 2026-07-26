@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.1
+
+- Use `sapnmeterdata==0.3.1`, which supports Home Assistant's pinned
+  `pandas==2.3.3` dependency.
+
 ## 0.2.0
 
 - Import historical SAPN readings into Home Assistant Recorder statistics.
@@ -13,4 +18,3 @@
 - Skip unavailable NMIs without blocking successful meters.
 - Migrate existing 0.1.x single-NMI config entries.
 - Update the client dependency to `sapnmeterdata==0.3.0`.
-

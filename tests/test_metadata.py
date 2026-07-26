@@ -7,11 +7,11 @@ ROOT = Path(__file__).parents[1]
 INTEGRATION = ROOT / "custom_components" / "sapnmeterdata"
 
 
-def test_manifest_is_the_compatible_023_update() -> None:
+def test_manifest_is_the_compatible_024_update() -> None:
     """The release preserves the domain and pins the tested portal client."""
     manifest = json.loads((INTEGRATION / "manifest.json").read_text())
     assert manifest["domain"] == "sapnmeterdata"
-    assert manifest["version"] == "0.2.3"
+    assert manifest["version"] == "0.2.4"
     assert manifest["config_flow"] is True
     assert "recorder" in manifest["dependencies"]
     assert manifest["requirements"] == ["sapnmeterdata==0.3.2"]
@@ -62,10 +62,12 @@ def test_historical_backfill_is_exposed_and_chunked() -> None:
 
 
 def test_alignment_migration_replaces_old_statistics() -> None:
-    """Version 0.2.3 clears the half-hour-shifted 0.2.2 rows."""
+    """The migration queues deletion on Home Assistant's recorder thread."""
     coordinator = (INTEGRATION / "coordinator.py").read_text()
     transform = (INTEGRATION / "transform.py").read_text()
 
-    assert "clear_statistics" in coordinator
+    assert "recorder.async_clear_statistics(stat_ids)" in coordinator
+    assert "await recorder.async_block_till_done()" in coordinator
+    assert "clear_statistics," not in coordinator
     assert "STATISTICS_ALIGNMENT_VERSION" in coordinator
     assert "tz_convert(UTC)" in transform

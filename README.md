@@ -8,18 +8,19 @@ selected directly in the Energy Dashboard.
 This integration uses
 [`sapnmeterdata`](https://pypi.org/project/sapnmeterdata/) 0.3.2.
 
-Version 0.2.3 aligns SAPN readings to Home Assistant's UTC statistics hours and
-adds a resumable historical import. It continues to use `sapnmeterdata` 0.3.2,
-which avoids a native Polars runtime and is compatible with Home Assistant's
-pinned pandas installation.
+Version 0.2.4 aligns SAPN readings to Home Assistant's UTC statistics hours,
+adds a resumable historical import, and runs the one-time statistics migration
+on Home Assistant's dedicated Recorder thread. It continues to use
+`sapnmeterdata` 0.3.2, which avoids a native Polars runtime and is compatible
+with Home Assistant's pinned pandas installation.
 
-## Upgrading to 0.2.3
+## Upgrading to 0.2.4
 
 Versions 0.2.0–0.2.2 wrote Adelaide clock-hour timestamps. Adelaide's
 half-hour UTC offset meant those readings did not line up with Home Assistant's
 native solar statistics, causing grid and consumed-solar bars to alternate.
 
-On its first start, 0.2.3 automatically removes those misaligned SAPN rows and
+On its first successful start, 0.2.4 automatically removes those misaligned SAPN rows and
 reimports the latest available day on UTC hour boundaries. The statistic IDs do
 not change, so existing Energy Dashboard selections are preserved. Use the
 **Update historical data** button afterward to restore all older available

@@ -15,7 +15,6 @@ from homeassistant.components.recorder.models import (
 )
 from homeassistant.components.recorder.statistics import (
     async_add_external_statistics,
-    clear_statistics,
     get_last_statistics,
     statistics_during_period,
 )
@@ -274,11 +273,8 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             for direction in ("consumption", "return")
         ]
         recorder = get_instance(self.hass)
-        await recorder.async_add_executor_job(
-            clear_statistics,
-            recorder,
-            stat_ids,
-        )
+        recorder.async_clear_statistics(stat_ids)
+        await recorder.async_block_till_done()
         state["statistics_alignment_version"] = STATISTICS_ALIGNMENT_VERSION
         state["last_processed"] = {}
         state["earliest_processed"] = {}

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.4
+
+- Run the UTC-alignment statistics deletion through Home Assistant's dedicated
+  Recorder task queue.
+- Wait for the queued deletion to finish before saving the migration checkpoint
+  and importing replacement statistics.
+- Fix the `Detected unsafe call not in recorder thread` startup failure in
+  Home Assistant releases using Recorder thread-safety checks.
+
 ## 0.2.3
 
 - Align external statistics to UTC hour boundaries so SAPN grid and

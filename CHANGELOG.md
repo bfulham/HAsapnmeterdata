@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.3.0
+
+- Discover the actual NEM12 channels for every selected meter from a bounded
+  recent 14-day sample during setup and options.
+- Import each enabled NMI/channel pair as its own long-term statistic instead
+  of combining all E or B channels.
+- Let every channel have a different user-facing name and classification for
+  each meter.
+- Default E channels to grid consumption, B channels to return to grid, and
+  reactive or unknown channels to Ignore.
+- Use stable `sapnmeterdata:<nmi>_<channel>` statistic IDs so later channel
+  renames retain their history.
+- Migrate 0.1.x and 0.2.x entries, remove legacy aggregate statistics, and
+  preserve the 3:00 am publication and resumable historical-import behaviour.
+
 ## 0.2.5
 
 - Defer the initial SAPN refresh and Recorder statistics migration until Home

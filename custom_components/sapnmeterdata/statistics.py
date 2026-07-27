@@ -25,20 +25,22 @@ class HourlyStream:
     channels: tuple[str, ...]
 
 
-def statistic_id(nmi: str, direction: str) -> str:
-    """Return a stable Home Assistant external statistic ID."""
+def statistic_id(nmi: str, channel: str) -> str:
+    """Return a stable NMI/channel Home Assistant external statistic ID."""
     safe_nmi = re.sub(r"[^a-z0-9_]", "_", str(nmi).lower()).strip("_")
-    return f"sapnmeterdata:{safe_nmi}_{direction}"
+    safe_channel = re.sub(r"[^a-z0-9_]", "_", str(channel).lower()).strip("_")
+    return f"sapnmeterdata:{safe_nmi}_{safe_channel}"
 
 
 def statistic_name(
     nmi: str,
-    direction: str,
+    channel: str,
     friendly_name: str | None = None,
+    channel_name: str | None = None,
 ) -> str:
-    """Return a user-facing statistic name."""
-    label = "Grid consumption" if direction == "consumption" else "Return to grid"
+    """Return a user-facing name for one meter channel."""
     meter_name = friendly_name.strip() if friendly_name else str(nmi)
+    label = channel_name.strip() if channel_name else str(channel)
     return f"SAPN {meter_name} {label}"
 
 

@@ -8,41 +8,39 @@ selected directly in the Energy Dashboard.
 This integration uses
 [`sapnmeterdata`](https://pypi.org/project/sapnmeterdata/) 0.3.3.
 
-Version 0.2.5 waits until Home Assistant has finished starting before it
-accesses Recorder or the SAPN portal. It also reads each meter's description
-from SAPN and uses that friendly name throughout the integration while keeping
-the existing NMI-based statistic IDs.
+Version 0.3.0 imports every selected NEM12 channel as its own statistic.
+Channels are discovered from a bounded recent sample and can be named and
+classified separately for every meter.
 
-## Upgrading to 0.2.5
+## Upgrading to 0.3.0
 
-Versions 0.2.0–0.2.2 wrote Adelaide clock-hour timestamps. Adelaide's
-half-hour UTC offset meant those readings did not line up with Home Assistant's
-native solar statistics, causing grid and consumed-solar bars to alternate.
+Versions through 0.2.5 combined all matching E channels into one consumption
+statistic and all matching B channels into one return-to-grid statistic.
+Version 0.3.0 replaces those aggregate streams with stable NMI/channel pairs:
 
-Version 0.2.5 automatically removes those misaligned SAPN rows and reimports
-the latest available day on UTC hour boundaries. This migration now begins
-only after Home Assistant reaches its running state, avoiding the startup wait
-that could occur in 0.2.4 when Recorder had not begun processing queued work.
-Use the **Update historical data** button afterward to restore all older
-available history in the corrected format.
+- `sapnmeterdata:20023157519_e1`
+- `sapnmeterdata:20023157519_e2`
+- `sapnmeterdata:20023157519_b1`
 
-SAPN meter descriptions now appear in the meter selector, status sensor, and
-external statistic names. For example, `MRC` is shown instead of
-`20023157519`. The statistic ID remains
-`sapnmeterdata:20023157519_consumption`, so existing Energy Dashboard
-selections and imported history are preserved.
+The one-time migration removes the old aggregate SAPN statistics and imports
+the latest available day using the new channel IDs. Existing Energy Dashboard
+selections that point to `<nmi>_consumption` or `<nmi>_return` must be replaced
+with the appropriate channel statistics. Press **Update historical data**
+afterward to populate older history for every enabled channel.
 
-Existing 0.1.x config entries are also migrated automatically. Each old entry
-keeps its configured email, password, and NMI. Open **Configure** afterward to
-refresh the account's NMI list and select additional meters.
+Existing entries retain their credentials, selected NMIs, friendly meter
+names, and the previous E/B classification defaults. Open **Configure** after
+upgrading to inspect the channels SAPN currently returns and give each one a
+useful name.
 
 ## What it does
 
 - Discovers assigned NMIs and their SAPN meter descriptions.
-- Imports SAPN's latest completed Adelaide calendar day.
-- Combines matching NEM12 channels:
-  - `E*` is grid consumption by default.
-  - `B*` is return to grid by default.
+- Discovers the actual NEM12 channels returned for each selected meter.
+- Imports every enabled channel separately.
+- Lets each NMI/channel pair have its own name and classification.
+- Defaults `E*` to grid consumption and `B*` to return to grid.
+- Detects other registers such as `K1` and `Q1` but ignores them by default.
 - Aggregates five-minute readings into Home Assistant's required hourly
   external statistics, including 23- and 25-hour daylight-saving days.
 - Aligns every imported row to Home Assistant's UTC hour boundaries so grid,
@@ -91,11 +89,20 @@ under your Home Assistant configuration directory, then restart Home Assistant.
 3. Enter the email and password used for the SAPN meter-data portal.
 4. Select one or more meters. The list shows SAPN's friendly description and
    NMI so similarly named meters can still be distinguished.
-5. Keep the defaults unless your NEM12 channels use different directions:
-   - Grid consumption: `E*`
-   - Return to grid: `B*`
+5. Wait while the integration inspects a recent 14-day sample for each selected
+   meter.
+6. For every discovered channel:
+   - enter the name that should appear in Home Assistant;
+   - choose **Grid consumption**, **Return to grid**, or **Ignore**.
 
-Multiple patterns can be separated by commas, for example `E1,E2`.
+For example:
+
+| Meter | Channel | Name | Use as |
+|---|---|---|---|
+| NMI 1 | `E1` | Standard Consumption | Grid consumption |
+| NMI 1 | `E2` | Controlled Load | Grid consumption |
+| NMI 1 | `B1` | Solar | Return to grid |
+| NMI 2 | `E1` | Pump Station | Grid consumption |
 
 ## Add it to the Energy Dashboard
 
@@ -103,15 +110,16 @@ After the first successful import:
 
 1. Go to **Settings → Dashboards → Energy**.
 2. Under **Electricity grid**, choose **Add consumption**.
-3. Select `SAPN <friendly name> Grid consumption`.
-4. If the meter exports energy, add **Return to grid** and select
-   `SAPN <friendly name> Return to grid`.
+3. Add each consumption channel you want included, such as
+   `SAPN MRC Standard Consumption` and `SAPN MRC Controlled Load`.
+4. Under **Return to grid**, select the named export channel, such as
+   `SAPN MRC Solar`.
 5. Add a tariff entity only if you want Home Assistant to calculate cost.
 
-The external statistic IDs are:
-
-- `sapnmeterdata:<nmi>_consumption`
-- `sapnmeterdata:<nmi>_return`
+External statistic IDs use
+`sapnmeterdata:<nmi>_<channel>`. Renaming a channel changes only its displayed
+name; its statistic ID and accumulated history remain attached to the NMI and
+SAPN channel code.
 
 ## Import behavior
 
@@ -150,16 +158,21 @@ the completed and failed NMIs, and the number of imported chunks. Its
 `meter_names` attribute maps each stable NMI to the friendly name returned by
 SAPN.
 
-## Channel mapping
+## Channel configuration
 
-| Pattern | Imported as | Examples |
-|---|---|---|
-| `E*` | Grid consumption | `E1`, `E2` |
-| `B*` | Return to grid | `B1` |
-| unmatched | Ignored | `K1`, `Q1` |
+Each meter has its own channel map, so `E1` can be named **Standard
+Consumption** on one NMI and **Pump Station** on another.
 
-Change the selected NMIs or channel patterns from the integration's
-**Configure** dialog.
+| Channel default | Initial classification |
+|---|---|
+| `E*` | Grid consumption |
+| `B*` | Return to grid |
+| Other channels | Ignore |
+
+Change selected meters, channel names, or classifications from the
+integration's **Configure** dialog. If you enable a previously ignored channel,
+the integration reimports the latest available day. Press **Update historical
+data** to fill its older history in bounded seven-day chunks.
 
 ## Data retention and removal
 

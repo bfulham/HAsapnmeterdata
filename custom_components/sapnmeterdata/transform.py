@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import fnmatch
 import math
-import re
 from collections.abc import Iterable
 from datetime import UTC, datetime
 
@@ -13,28 +11,20 @@ import pandas as pd
 from .statistics import HourlyPoint, HourlyStream
 
 
-def parse_patterns(value: str | Iterable[str]) -> tuple[str, ...]:
-    """Return normalized, non-empty channel patterns."""
-    if isinstance(value, str):
-        parts = re.split(r"[,;\s]+", value)
-    else:
-        parts = [str(part) for part in value]
-    return tuple(part.strip().upper() for part in parts if part.strip())
-
-
-def _matches(channel: str, patterns: tuple[str, ...]) -> bool:
-    """Return whether a channel matches any configured glob."""
-    normalized = channel.upper()
-    return any(fnmatch.fnmatchcase(normalized, pattern) for pattern in patterns)
-
-
-def _channel_series(
-    frame: pd.DataFrame,
-    channels: tuple[str, ...],
-) -> pd.Series:
-    """Combine interval energy across selected channels."""
-    selected = frame.loc[:, list(channels)].apply(pd.to_numeric, errors="coerce")
-    return selected.sum(axis=1, min_count=1)
+def available_channels(frame: pd.DataFrame, nmi: str) -> tuple[str, ...]:
+    """Return the NEM12 channels present for one NMI."""
+    if frame.empty:
+        return ()
+    if not isinstance(frame.columns, pd.MultiIndex) or frame.columns.nlevels < 2:
+        raise ValueError("SAPN data does not have NMI/channel MultiIndex columns")
+    channels = {
+        str(column[1]).strip().upper()
+        for column in frame.columns
+        if str(column[0]) == str(nmi) and str(column[1]).strip()
+    }
+    if not channels:
+        raise ValueError(f"SAPN data does not contain columns for NMI {nmi}")
+    return tuple(sorted(channels))
 
 
 def _hourly_points(
@@ -73,45 +63,37 @@ def _hourly_points(
     )
 
 
-def extract_hourly_streams(
+def extract_hourly_channels(
     frame: pd.DataFrame,
     nmi: str,
-    consumption_patterns: str | Iterable[str],
-    return_patterns: str | Iterable[str],
+    channels: Iterable[str],
     timezone_name: str,
     window_start: datetime | None = None,
     window_end: datetime | None = None,
 ) -> dict[str, HourlyStream]:
-    """Extract UTC-hour consumption and return-to-grid streams for one NMI."""
+    """Extract a separate UTC-hour stream for every enabled NEM12 channel."""
     if frame.empty:
         return {}
-    if not isinstance(frame.columns, pd.MultiIndex) or frame.columns.nlevels < 2:
-        raise ValueError("SAPN data does not have NMI/channel MultiIndex columns")
 
     nmi_columns = [column for column in frame.columns if str(column[0]) == str(nmi)]
     if not nmi_columns:
         raise ValueError(f"SAPN data does not contain columns for NMI {nmi}")
 
     by_channel = frame.loc[:, nmi_columns].copy()
-    by_channel.columns = [str(column[1]) for column in nmi_columns]
+    by_channel.columns = [str(column[1]).strip().upper() for column in nmi_columns]
 
-    pattern_sets = {
-        "consumption": parse_patterns(consumption_patterns),
-        "return": parse_patterns(return_patterns),
-    }
     streams: dict[str, HourlyStream] = {}
-    for direction, patterns in pattern_sets.items():
-        channels = tuple(
-            channel for channel in by_channel.columns if _matches(channel, patterns)
-        )
-        if not channels:
+    for raw_channel in channels:
+        channel = str(raw_channel).strip().upper()
+        if channel not in by_channel.columns:
             continue
+        series = pd.to_numeric(by_channel[channel], errors="coerce")
         points = _hourly_points(
-            _channel_series(by_channel, channels),
+            series,
             timezone_name,
             window_start,
             window_end,
         )
         if points:
-            streams[direction] = HourlyStream(points=points, channels=channels)
+            streams[channel] = HourlyStream(points=points, channels=(channel,))
     return streams

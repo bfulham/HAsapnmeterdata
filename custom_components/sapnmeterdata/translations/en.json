@@ -11,17 +11,15 @@
         }
       },
       "meters": {
-        "title": "Choose meters and channels",
-        "description": "Select the NMIs to import. SAPN commonly uses E channels for grid consumption and B channels for return to grid. Multiple patterns can be separated with commas.",
+        "title": "Choose meters",
+        "description": "Select the SAPN meters to import. Home Assistant will inspect a recent 14-day sample to find each meter's NEM12 channels.",
         "data": {
-          "nmis": "NMIs",
-          "consumption_channels": "Grid consumption channel patterns",
-          "return_channels": "Return-to-grid channel patterns"
-        },
-        "data_description": {
-          "consumption_channels": "Default: E* (for example E1 and E2)",
-          "return_channels": "Default: B* (for example B1)"
+          "nmis": "Meters"
         }
+      },
+      "channels": {
+        "title": "Name meter channels",
+        "description": "Every discovered channel is kept separate. Give each channel a useful name and choose whether it represents grid consumption, return to grid, or should be ignored. {discovery_result}"
       },
       "reauth_confirm": {
         "title": "Reconnect to SA Power Networks",
@@ -36,6 +34,7 @@
       "invalid_auth": "The SAPN credentials were rejected.",
       "no_nmis": "No NMIs were assigned to this SAPN account.",
       "select_nmi": "Select at least one NMI.",
+      "channel_discovery": "The selected meters' channels could not be inspected. Try again.",
       "unknown": "Unexpected error."
     },
     "abort": {
@@ -47,22 +46,21 @@
     "step": {
       "init": {
         "title": "SA Power Networks Meter Data options",
-        "description": "Choose which NMIs and NEM12 channel patterns are imported.",
+        "description": "Choose which SAPN meters are imported. Their recent NEM12 channels will be inspected on the next step.",
         "data": {
-          "nmis": "NMIs",
-          "consumption_channels": "Grid consumption channel patterns",
-          "return_channels": "Return-to-grid channel patterns"
-        },
-        "data_description": {
-          "consumption_channels": "Default: E* (for example E1 and E2)",
-          "return_channels": "Default: B* (for example B1)"
+          "nmis": "Meters"
         }
+      },
+      "channels": {
+        "title": "Name meter channels",
+        "description": "Rename or reclassify each channel. Existing statistic IDs remain based on the NMI and channel code. {discovery_result}"
       }
     },
     "error": {
       "cannot_connect": "Could not refresh the NMIs from the SAPN portal. Saved NMIs are still available.",
       "invalid_auth": "The SAPN credentials were rejected.",
       "select_nmi": "Select at least one NMI.",
+      "channel_discovery": "The selected meters' channels could not be inspected. Try again.",
       "unknown": "Unexpected error while refreshing NMIs."
     }
   },

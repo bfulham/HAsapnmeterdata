@@ -34,17 +34,22 @@ def _load_component_module(name: str) -> ModuleType:
 
 statistics = _load_component_module("statistics")
 schedule = _load_component_module("schedule")
+channels = _load_component_module("channels")
 transform = _load_component_module("transform")
 
 HourlyPoint = statistics.HourlyPoint
 build_statistics = statistics.build_statistics
+default_channel_type = channels.default_channel_type
 derive_base_sum = statistics.derive_base_sum
 derive_prepend_base_sum = statistics.derive_prepend_base_sum
-extract_hourly_streams = transform.extract_hourly_streams
+enabled_channels = channels.enabled_channels
+extract_hourly_channels = transform.extract_hourly_channels
 historical_chunk = schedule.historical_chunk
 latest_available_date = schedule.latest_available_date
+merge_channel_config = channels.merge_channel_config
 next_daily_refresh = schedule.next_daily_refresh
-parse_patterns = transform.parse_patterns
+normalize_channel_config = channels.normalize_channel_config
+parse_patterns = channels.parse_patterns
 statistic_id = statistics.statistic_id
 statistic_name = statistics.statistic_name
 utc_statistic_window = schedule.utc_statistic_window
@@ -129,8 +134,8 @@ def test_patterns_accept_commas_semicolons_and_spaces() -> None:
     assert parse_patterns("E1, e2; E*") == ("E1", "E2", "E*")
 
 
-def test_interval_channels_are_combined_and_aggregated_hourly() -> None:
-    """Channels combine into complete UTC-aligned Home Assistant hours."""
+def test_interval_channels_remain_separate_and_aggregate_hourly() -> None:
+    """Every enabled channel gets its own UTC-aligned hourly stream."""
     target_start = date(2026, 7, 12)
     target_end = date(2026, 7, 13)
     index = pd.date_range(
@@ -144,23 +149,60 @@ def test_interval_channels_are_combined_and_aggregated_hourly() -> None:
         target_end,
         "Australia/Adelaide",
     )
-    streams = extract_hourly_streams(
+    streams = extract_hourly_channels(
         _frame(index),
         "20023157519",
-        "E*",
-        "B*",
+        ("E1", "E2", "B1"),
         "Australia/Adelaide",
         window_start,
         window_end,
     )
 
-    assert streams["consumption"].channels == ("E1", "E2")
-    assert streams["return"].channels == ("B1",)
-    assert len(streams["consumption"].points) == 24
-    assert streams["consumption"].points[0].value == pytest.approx(1.8)
-    assert streams["return"].points[0].value == pytest.approx(0.24)
-    assert all(point.start.tzinfo is UTC for point in streams["consumption"].points)
-    assert all(point.start.minute == 0 for point in streams["consumption"].points)
+    assert set(streams) == {"E1", "E2", "B1"}
+    assert streams["E1"].channels == ("E1",)
+    assert streams["E2"].channels == ("E2",)
+    assert streams["B1"].channels == ("B1",)
+    assert len(streams["E1"].points) == 24
+    assert streams["E1"].points[0].value == pytest.approx(1.2)
+    assert streams["E2"].points[0].value == pytest.approx(0.6)
+    assert streams["B1"].points[0].value == pytest.approx(0.24)
+    assert all(point.start.tzinfo is UTC for point in streams["E1"].points)
+    assert all(point.start.minute == 0 for point in streams["E1"].points)
+
+
+def test_channel_defaults_keep_reactive_registers_ignored() -> None:
+    """E/B channels get safe energy defaults and K/Q remain ignored."""
+    config = merge_channel_config(
+        ["20023157519"],
+        {"20023157519": ("E1", "E2", "B1", "K1", "Q1")},
+    )
+    meter_config = config["20023157519"]
+
+    assert default_channel_type("E1") == "consumption"
+    assert default_channel_type("B1") == "return"
+    assert default_channel_type("K1") == "ignore"
+    assert enabled_channels(meter_config) == ("E1", "E2", "B1")
+
+
+def test_same_channel_code_can_have_a_different_name_per_meter() -> None:
+    """Channel definitions are nested under their stable NMI identity."""
+    config = normalize_channel_config(
+        {
+            "NMI1": {
+                "E1": {"name": "Standard Consumption", "type": "consumption"},
+                "E2": {"name": "Controlled Load", "type": "consumption"},
+                "B1": {"name": "Solar", "type": "return"},
+            },
+            "NMI2": {
+                "E1": {"name": "Pump Station", "type": "consumption"},
+            },
+        }
+    )
+
+    assert config["NMI1"]["E1"]["name"] == "Standard Consumption"
+    assert config["NMI1"]["E2"]["name"] == "Controlled Load"
+    assert config["NMI1"]["B1"]["name"] == "Solar"
+    assert config["NMI2"]["E1"]["name"] == "Pump Station"
 
 
 def test_adelaide_half_hour_is_aligned_to_utc_statistics() -> None:
@@ -202,16 +244,15 @@ def test_daylight_saving_days_have_the_correct_hour_count(
         end.date(),
         "Australia/Adelaide",
     )
-    streams = extract_hourly_streams(
+    streams = extract_hourly_channels(
         _frame(index),
         "20023157519",
-        "E*",
-        "B*",
+        ("E1",),
         "Australia/Adelaide",
         window_start,
         window_end,
     )
-    assert len(streams["consumption"].points) == expected_hours
+    assert len(streams["E1"].points) == expected_hours
 
 
 def test_new_stream_gets_a_baseline_and_continuous_sum() -> None:
@@ -306,17 +347,21 @@ def test_historical_chunk_moves_back_seven_days() -> None:
 
 
 def test_statistic_id_preserves_the_existing_integration_domain() -> None:
-    """0.2.0 keeps the domain used by the 0.1.x repository."""
-    assert (
-        statistic_id("20023157519", "consumption")
-        == "sapnmeterdata:20023157519_consumption"
-    )
+    """Each NMI/channel pair gets a stable independent statistic ID."""
+    assert statistic_id("20023157519", "E1") == "sapnmeterdata:20023157519_e1"
+    assert statistic_id("20023157519", "E2") == "sapnmeterdata:20023157519_e2"
+    assert statistic_id("20023157519", "B1") == "sapnmeterdata:20023157519_b1"
 
 
 def test_statistic_name_uses_the_sapn_friendly_meter_name() -> None:
-    """The stable NMI ID and human-facing statistic name remain separate."""
+    """Meter and user-supplied channel names are both user-facing."""
     assert (
-        statistic_name("20023157519", "consumption", "MRC")
-        == "SAPN MRC Grid consumption"
+        statistic_name(
+            "20023157519",
+            "E1",
+            "MRC",
+            "Standard Consumption",
+        )
+        == "SAPN MRC Standard Consumption"
     )
-    assert statistic_name("20023157519", "return", "MRC") == "SAPN MRC Return to grid"
+    assert statistic_name("20023157519", "B1", "MRC", "Solar") == "SAPN MRC Solar"

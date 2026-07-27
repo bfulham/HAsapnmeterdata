@@ -26,7 +26,12 @@ from homeassistant.helpers import storage
 from homeassistant.helpers.event import async_call_later, async_track_point_in_utc_time
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
+from .channels import enabled_channels, merge_channel_config, normalize_channel_config
 from .const import (
+    CHANNEL_TYPE_IGNORE,
+    CONF_CHANNEL_CONFIG,
+    CONF_CHANNEL_NAME,
+    CONF_CHANNEL_TYPE,
     CONF_CONSUMPTION_CHANNELS,
     CONF_NMI_NAMES,
     CONF_NMIS,
@@ -98,6 +103,8 @@ class FetchBatch:
     no_data: dict[str, str] = field(default_factory=dict)
     errors: dict[str, str] = field(default_factory=dict)
     meter_names: dict[str, str] = field(default_factory=dict)
+    channel_config: dict[str, dict[str, dict[str, str]]] = field(default_factory=dict)
+    ignored: set[str] = field(default_factory=set)
     assignment_error: str | None = None
 
 
@@ -107,6 +114,7 @@ def _fetch_meter_data(
     targets: dict[str, LocalDateRange],
     consumption_channels: str,
     return_channels: str,
+    channel_config: Mapping[str, Any],
     discover_meter_names: bool,
 ) -> FetchBatch:
     """Fetch and transform date ranges without blocking HA's event loop."""
@@ -119,7 +127,7 @@ def _fetch_meter_data(
         meter,
     )
 
-    from .transform import extract_hourly_streams
+    from .transform import available_channels, extract_hourly_channels
 
     try:
         client = login(email, password)
@@ -163,11 +171,24 @@ def _fetch_meter_data(
             result.errors[nmi] = str(err)
         else:
             try:
-                result.streams[nmi] = extract_hourly_streams(
+                discovered = {nmi: available_channels(frame, nmi)}
+                resolved = merge_channel_config(
+                    [nmi],
+                    discovered,
+                    channel_config,
+                    consumption_patterns=consumption_channels,
+                    return_patterns=return_channels,
+                )[nmi]
+                result.channel_config[nmi] = resolved
+                selected_channels = enabled_channels(resolved)
+                if not selected_channels:
+                    result.ignored.add(nmi)
+                    result.streams[nmi] = {}
+                    continue
+                result.streams[nmi] = extract_hourly_channels(
                     frame,
                     nmi,
-                    consumption_channels,
-                    return_channels,
+                    selected_channels,
                     SAPN_TIME_ZONE,
                     window_start,
                     window_end,
@@ -224,6 +245,19 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             nmis,
             config.get(CONF_NMI_NAMES, {}),
         )
+        channel_config = merge_channel_config(
+            nmis,
+            {},
+            config.get(CONF_CHANNEL_CONFIG, {}),
+            consumption_patterns=config.get(
+                CONF_CONSUMPTION_CHANNELS,
+                DEFAULT_CONSUMPTION_CHANNELS,
+            ),
+            return_patterns=config.get(
+                CONF_RETURN_CHANNELS,
+                DEFAULT_RETURN_CHANNELS,
+            ),
+        )
         available_day = latest_available_date(
             datetime.now(UTC),
             SAPN_TIME_ZONE,
@@ -237,10 +271,12 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "imported": [],
             "waiting": [],
             "skipped": [],
+            "ignored": [],
             "errors": {},
             "channels": {},
             "statistics": {},
             "meter_names": meter_names,
+            "channel_config": channel_config,
             "last_processed": {},
             "earliest_processed": {},
             "historical_backfill": {
@@ -321,6 +357,7 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._state.setdefault("last_processed", {})
             self._state.setdefault("earliest_processed", {})
             self._state.setdefault("meter_names", {})
+            self._state.setdefault("channel_config", {})
             self._state.setdefault(
                 "historical_backfill",
                 {
@@ -338,7 +375,7 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         state: dict[str, Any],
         nmis: list[str],
     ) -> None:
-        """Replace local-hour 0.2.2 rows with UTC-hour statistics."""
+        """Clear legacy aggregate statistics before per-channel importing."""
         if state.get("statistics_alignment_version") == STATISTICS_ALIGNMENT_VERSION:
             return
 
@@ -362,7 +399,33 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         }
         state.pop("last_successful_import", None)
         await self._store.async_save(state)
-        LOGGER.info("Reset SAPN statistics for UTC-hour alignment migration")
+        LOGGER.info("Reset legacy SAPN aggregate statistics for per-channel import")
+
+    async def _async_handle_channel_config_change(
+        self,
+        state: dict[str, Any],
+        configured_channels: Any,
+    ) -> None:
+        """Restart checkpoints when the user changes enabled channel streams."""
+        normalized = normalize_channel_config(configured_channels)
+        previous = state.get("configured_channel_config")
+        if previous == normalized:
+            return
+
+        state["configured_channel_config"] = normalized
+        if previous is not None:
+            state["last_processed"] = {}
+            state["earliest_processed"] = {}
+            state["historical_backfill"] = {
+                "active": False,
+                "before": {},
+                "completed": [],
+                "failed": {},
+                "chunks_imported": 0,
+            }
+            state.pop("last_successful_import", None)
+            LOGGER.info("Reset SAPN checkpoints after channel configuration changed")
+        await self._store.async_save(state)
 
     @staticmethod
     def _target_dates(
@@ -453,6 +516,7 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         config: dict[str, Any],
         targets: dict[str, LocalDateRange],
         discover_meter_names: bool,
+        channel_config: Mapping[str, Any],
     ) -> FetchBatch:
         """Fetch one forward or historical batch."""
         try:
@@ -466,6 +530,7 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     DEFAULT_CONSUMPTION_CHANNELS,
                 ),
                 config.get(CONF_RETURN_CHANNELS, DEFAULT_RETURN_CHANNELS),
+                channel_config,
                 discover_meter_names,
             )
         except PortalAuthError as err:
@@ -523,13 +588,14 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def _async_import_stream(
         self,
         nmi: str,
-        direction: str,
+        channel: str,
         points: tuple[HourlyPoint, ...],
         mode: Literal["forward", "backfill"],
         friendly_name: str,
+        channel_name: str,
     ) -> str:
-        """Import one consumption or return-to-grid stream."""
-        stat_id = statistic_id(nmi, direction)
+        """Import one independently configured NEM12 channel."""
+        stat_id = statistic_id(nmi, channel)
         existing, reference = await self._async_existing_statistics(
             stat_id,
             points,
@@ -549,7 +615,12 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         metadata: StatisticMetaData = {
             "mean_type": StatisticMeanType.NONE,
             "has_sum": True,
-            "name": statistic_name(nmi, direction, friendly_name),
+            "name": statistic_name(
+                nmi,
+                channel,
+                friendly_name,
+                channel_name,
+            ),
             "source": DOMAIN,
             "statistic_id": stat_id,
             "unit_class": "energy",
@@ -594,6 +665,31 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 changed = True
         return changed
 
+    @staticmethod
+    def _merge_channel_definitions(
+        state: dict[str, Any],
+        channel_config: dict[str, dict[str, dict[str, str]]],
+        discovered_config: Mapping[str, Mapping[str, Mapping[str, str]]],
+    ) -> bool:
+        """Persist newly found channels without overriding configured values."""
+        stored = state.setdefault("channel_config", {})
+        changed = False
+        for nmi, discovered_channels in discovered_config.items():
+            meter_config = channel_config.setdefault(nmi, {})
+            stored_meter = stored.setdefault(nmi, {})
+            for channel, definition in discovered_channels.items():
+                normalized = {
+                    CONF_CHANNEL_NAME: str(definition.get(CONF_CHANNEL_NAME, channel)),
+                    CONF_CHANNEL_TYPE: str(
+                        definition.get(CONF_CHANNEL_TYPE, CHANNEL_TYPE_IGNORE)
+                    ),
+                }
+                meter_config[channel] = normalized
+                if stored_meter.get(channel) != normalized:
+                    stored_meter[channel] = normalized
+                    changed = True
+        return changed
+
     @override
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch the newest day or one rate-limited historical chunk."""
@@ -604,10 +700,28 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         config = {**self._entry.data, **self._entry.options}
         nmis = [str(nmi) for nmi in config[CONF_NMIS]]
         await self._async_migrate_statistics_alignment(state, nmis)
+        await self._async_handle_channel_config_change(
+            state,
+            config.get(CONF_CHANNEL_CONFIG, {}),
+        )
         meter_names = self._meter_name_map(
             nmis,
             state.get("meter_names", {}),
             config.get(CONF_NMI_NAMES, {}),
+        )
+        channel_config = merge_channel_config(
+            nmis,
+            {},
+            state.get("channel_config", {}),
+            config.get(CONF_CHANNEL_CONFIG, {}),
+            consumption_patterns=config.get(
+                CONF_CONSUMPTION_CHANNELS,
+                DEFAULT_CONSUMPTION_CHANNELS,
+            ),
+            return_patterns=config.get(
+                CONF_RETURN_CHANNELS,
+                DEFAULT_RETURN_CHANNELS,
+            ),
         )
 
         last_processed: dict[str, str] = state["last_processed"]
@@ -641,10 +755,12 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "imported": [],
             "waiting": [],
             "skipped": [],
+            "ignored": [],
             "errors": {},
             "channels": {},
             "statistics": {},
             "meter_names": dict(meter_names),
+            "channel_config": channel_config,
             "name_discovery_error": None,
             "last_processed": dict(last_processed),
             "earliest_processed": dict(earliest_processed),
@@ -659,6 +775,7 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 config,
                 {},
                 True,
+                channel_config,
             )
             if self._merge_meter_names(state, meter_names, batch.meter_names):
                 await self._store.async_save(state)
@@ -670,22 +787,40 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             config,
             targets,
             discover_meter_names,
+            channel_config,
         )
         state_changed = self._merge_meter_names(
             state,
             meter_names,
             batch.meter_names,
         )
+        state_changed = (
+            self._merge_channel_definitions(
+                state,
+                channel_config,
+                batch.channel_config,
+            )
+            or state_changed
+        )
         imported: list[str] = []
         waiting: list[str] = []
         skipped: list[str] = []
+        ignored = sorted(batch.ignored)
         errors = dict(batch.errors)
-        channels: dict[str, dict[str, list[str]]] = {}
+        channels: dict[str, dict[str, dict[str, str]]] = {}
         statistics: dict[str, dict[str, str]] = {}
         queued_statistics = False
         backfill_progress = False
 
         if mode == "forward":
+            for nmi in ignored:
+                target_date = targets[nmi].start
+                last_processed[nmi] = target_date.isoformat()
+                stored_earliest = earliest_processed.get(nmi)
+                target_iso = target_date.isoformat()
+                if stored_earliest is None or target_iso < stored_earliest:
+                    earliest_processed[nmi] = target_iso
+                state_changed = True
             for nmi, message in batch.no_data.items():
                 target_date = targets[nmi].start
                 if target_date < available_day:
@@ -703,6 +838,10 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         else:
             backfill = state["historical_backfill"]
             completed = set(backfill.get("completed", []))
+            completed.update(ignored)
+            if ignored:
+                backfill_progress = True
+                state_changed = True
             for nmi, message in batch.no_data.items():
                 completed.add(nmi)
                 backfill_progress = True
@@ -721,11 +860,10 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 state_changed = True
 
         for nmi, streams in batch.streams.items():
+            if nmi in batch.ignored:
+                continue
             if not streams:
-                errors[nmi] = (
-                    "No channels matched the configured consumption or "
-                    "return-to-grid patterns."
-                )
+                errors[nmi] = "No enabled NEM12 channels contained interval data."
                 if mode == "backfill":
                     state["historical_backfill"].setdefault("failed", {})[nmi] = errors[
                         nmi
@@ -735,14 +873,16 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
             channels[nmi] = {}
             statistics[nmi] = {}
-            for direction, stream in streams.items():
-                channels[nmi][direction] = list(stream.channels)
-                statistics[nmi][direction] = await self._async_import_stream(
+            for channel, stream in streams.items():
+                definition = channel_config[nmi][channel]
+                channels[nmi][channel] = dict(definition)
+                statistics[nmi][channel] = await self._async_import_stream(
                     nmi,
-                    direction,
+                    channel,
                     stream.points,
                     mode,
                     meter_names[nmi],
+                    definition[CONF_CHANNEL_NAME],
                 )
                 queued_statistics = True
             imported.append(nmi)
@@ -789,7 +929,9 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             elif not pending and self._unsub_backfill_refresh is not None:
                 self._unsub_backfill_refresh()
                 self._unsub_backfill_refresh = None
-        elif state["historical_backfill"].get("active") and (imported or skipped):
+        elif state["historical_backfill"].get("active") and (
+            imported or skipped or ignored
+        ):
             self._schedule_backfill_refresh()
 
         if state_changed or imported:
@@ -803,6 +945,7 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             and not imported
             and not waiting
             and not skipped
+            and not ignored
         ):
             details = "; ".join(f"{nmi}: {error}" for nmi, error in errors.items())
             raise UpdateFailed(details)
@@ -822,10 +965,12 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "imported": imported,
                 "waiting": waiting,
                 "skipped": skipped,
+                "ignored": ignored,
                 "errors": errors,
                 "channels": channels,
                 "statistics": statistics,
                 "meter_names": dict(meter_names),
+                "channel_config": channel_config,
                 "name_discovery_error": batch.assignment_error,
                 "last_processed": dict(last_processed),
                 "earliest_processed": dict(earliest_processed),

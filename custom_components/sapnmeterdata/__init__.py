@@ -7,6 +7,7 @@ from homeassistant.helpers.start import async_at_started
 
 from .const import (
     CONF_AVAILABLE_NMIS,
+    CONF_CHANNEL_CONFIG,
     CONF_CONSUMPTION_CHANNELS,
     CONF_NMI_NAMES,
     CONF_NMIS,
@@ -19,10 +20,12 @@ PLATFORMS = [Platform.SENSOR, Platform.BUTTON]
 
 
 async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Migrate the single-NMI 0.1.x configuration to 0.2.0."""
-    if entry.version > 2:
+    """Migrate old aggregate-channel entries to per-channel configuration."""
+    if entry.version > 3:
         return False
 
+    data = dict(entry.data)
+    unique_id = entry.unique_id
     if entry.version == 1:
         nmi = str(entry.data[CONF_ID])
         email = entry.data[CONF_EMAIL]
@@ -35,13 +38,16 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             CONF_CONSUMPTION_CHANNELS: DEFAULT_CONSUMPTION_CHANNELS,
             CONF_RETURN_CHANNELS: DEFAULT_RETURN_CHANNELS,
         }
+        unique_id = f"{email.casefold()}:{nmi}"
+
+    if entry.version < 3:
+        data.setdefault(CONF_CHANNEL_CONFIG, {})
         hass.config_entries.async_update_entry(
             entry,
             data=data,
-            version=2,
-            unique_id=f"{email.casefold()}:{nmi}",
+            version=3,
+            unique_id=unique_id,
         )
-
     return True
 
 

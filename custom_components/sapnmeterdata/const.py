@@ -10,11 +10,24 @@ MANUFACTURER = "SA Power Networks"
 CONF_AVAILABLE_NMIS = "available_nmis"
 CONF_NMIS = "nmis"
 CONF_NMI_NAMES = "nmi_names"
+CONF_CHANNEL_CONFIG = "channel_config"
+CONF_CHANNEL_NAME = "name"
+CONF_CHANNEL_TYPE = "type"
 CONF_CONSUMPTION_CHANNELS = "consumption_channels"
 CONF_RETURN_CHANNELS = "return_channels"
 
+CHANNEL_TYPE_CONSUMPTION = "consumption"
+CHANNEL_TYPE_RETURN = "return"
+CHANNEL_TYPE_IGNORE = "ignore"
+CHANNEL_TYPES = (
+    CHANNEL_TYPE_CONSUMPTION,
+    CHANNEL_TYPE_RETURN,
+    CHANNEL_TYPE_IGNORE,
+)
+
 DEFAULT_CONSUMPTION_CHANNELS = "E*"
 DEFAULT_RETURN_CHANNELS = "B*"
+CHANNEL_DISCOVERY_DAYS = 14
 SAPN_TIME_ZONE = "Australia/Adelaide"
 
 # SAPN publishes the completed previous day at 03:00 Adelaide time. Schedule
@@ -24,7 +37,7 @@ DAILY_REFRESH_TIME = time(hour=3, minute=5)
 UPDATE_INTERVAL = timedelta(hours=3)
 HISTORICAL_CHUNK_DAYS = 7
 HISTORICAL_CHUNK_DELAY = timedelta(minutes=1)
-STATISTICS_ALIGNMENT_VERSION = 2
+STATISTICS_ALIGNMENT_VERSION = 3
 STORE_VERSION = 1
 
 STATUS_UP_TO_DATE = "up_to_date"

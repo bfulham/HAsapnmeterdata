@@ -31,10 +31,15 @@ def statistic_id(nmi: str, direction: str) -> str:
     return f"sapnmeterdata:{safe_nmi}_{direction}"
 
 
-def statistic_name(nmi: str, direction: str) -> str:
+def statistic_name(
+    nmi: str,
+    direction: str,
+    friendly_name: str | None = None,
+) -> str:
     """Return a user-facing statistic name."""
     label = "Grid consumption" if direction == "consumption" else "Return to grid"
-    return f"SAPN {nmi} {label}"
+    meter_name = friendly_name.strip() if friendly_name else str(nmi)
+    return f"SAPN {meter_name} {label}"
 
 
 def _row_timestamp(row: Mapping[str, Any]) -> float | None:

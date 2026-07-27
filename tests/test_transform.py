@@ -46,6 +46,7 @@ latest_available_date = schedule.latest_available_date
 next_daily_refresh = schedule.next_daily_refresh
 parse_patterns = transform.parse_patterns
 statistic_id = statistics.statistic_id
+statistic_name = statistics.statistic_name
 utc_statistic_window = schedule.utc_statistic_window
 
 ADELAIDE = ZoneInfo("Australia/Adelaide")
@@ -310,3 +311,12 @@ def test_statistic_id_preserves_the_existing_integration_domain() -> None:
         statistic_id("20023157519", "consumption")
         == "sapnmeterdata:20023157519_consumption"
     )
+
+
+def test_statistic_name_uses_the_sapn_friendly_meter_name() -> None:
+    """The stable NMI ID and human-facing statistic name remain separate."""
+    assert (
+        statistic_name("20023157519", "consumption", "MRC")
+        == "SAPN MRC Grid consumption"
+    )
+    assert statistic_name("20023157519", "return", "MRC") == "SAPN MRC Return to grid"

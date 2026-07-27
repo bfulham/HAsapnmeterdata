@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.5
+
+- Defer the initial SAPN refresh and Recorder statistics migration until Home
+  Assistant has completed startup, preventing the integration setup deadlock
+  seen in 0.2.4.
+- Use `sapnmeterdata==0.3.3` to discover each assigned meter's SAPN
+  description.
+- Show friendly meter names in setup, options, status data, and external
+  statistic names while preserving NMI-based statistic IDs.
+- Persist discovered meter names and refresh missing names automatically.
+
 ## 0.2.4
 
 - Run the UTC-alignment statistics deletion through Home Assistant's dedicated

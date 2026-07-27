@@ -2,11 +2,13 @@
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_EMAIL, CONF_ID, CONF_PASSWORD, Platform
-from homeassistant.core import HomeAssistant
+from homeassistant.core import CoreState, HomeAssistant
+from homeassistant.helpers.start import async_at_started
 
 from .const import (
     CONF_AVAILABLE_NMIS,
     CONF_CONSUMPTION_CHANNELS,
+    CONF_NMI_NAMES,
     CONF_NMIS,
     CONF_RETURN_CHANNELS,
     DEFAULT_CONSUMPTION_CHANNELS,
@@ -29,6 +31,7 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             CONF_PASSWORD: entry.data[CONF_PASSWORD],
             CONF_AVAILABLE_NMIS: [nmi],
             CONF_NMIS: [nmi],
+            CONF_NMI_NAMES: {nmi: nmi},
             CONF_CONSUMPTION_CHANNELS: DEFAULT_CONSUMPTION_CHANNELS,
             CONF_RETURN_CHANNELS: DEFAULT_RETURN_CHANNELS,
         }
@@ -50,9 +53,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     from .coordinator import SAPNMeterDataCoordinator
 
     coordinator = SAPNMeterDataCoordinator(hass, entry)
-    await coordinator.async_config_entry_first_refresh()
+    startup_pending = hass.state is not CoreState.running
+    if startup_pending:
+        coordinator.async_set_updated_data(coordinator.startup_data())
+    else:
+        await coordinator.async_config_entry_first_refresh()
     entry.runtime_data = coordinator
-    coordinator.async_start_daily_refresh()
+    if startup_pending:
+        entry.async_on_unload(
+            async_at_started(hass, coordinator.async_start_after_hass)
+        )
+    else:
+        coordinator.async_start_daily_refresh()
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))

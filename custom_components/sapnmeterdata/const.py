@@ -9,6 +9,7 @@ MANUFACTURER = "SA Power Networks"
 
 CONF_AVAILABLE_NMIS = "available_nmis"
 CONF_NMIS = "nmis"
+CONF_NMI_NAMES = "nmi_names"
 CONF_CONSUMPTION_CHANNELS = "consumption_channels"
 CONF_RETURN_CHANNELS = "return_channels"
 

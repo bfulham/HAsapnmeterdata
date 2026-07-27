@@ -7,14 +7,14 @@ ROOT = Path(__file__).parents[1]
 INTEGRATION = ROOT / "custom_components" / "sapnmeterdata"
 
 
-def test_manifest_is_the_compatible_024_update() -> None:
+def test_manifest_is_the_compatible_025_update() -> None:
     """The release preserves the domain and pins the tested portal client."""
     manifest = json.loads((INTEGRATION / "manifest.json").read_text())
     assert manifest["domain"] == "sapnmeterdata"
-    assert manifest["version"] == "0.2.4"
+    assert manifest["version"] == "0.2.5"
     assert manifest["config_flow"] is True
     assert "recorder" in manifest["dependencies"]
-    assert manifest["requirements"] == ["sapnmeterdata==0.3.2"]
+    assert manifest["requirements"] == ["sapnmeterdata==0.3.3"]
 
 
 def test_english_translation_matches_strings() -> None:
@@ -71,3 +71,29 @@ def test_alignment_migration_replaces_old_statistics() -> None:
     assert "clear_statistics," not in coordinator
     assert "STATISTICS_ALIGNMENT_VERSION" in coordinator
     assert "tz_convert(UTC)" in transform
+
+
+def test_recorder_work_is_deferred_until_home_assistant_started() -> None:
+    """Bootstrap must not wait for Recorder tasks that cannot run yet."""
+    setup = (INTEGRATION / "__init__.py").read_text()
+    coordinator = (INTEGRATION / "coordinator.py").read_text()
+
+    assert "startup_pending = hass.state is not CoreState.running" in setup
+    assert "coordinator.async_set_updated_data(coordinator.startup_data())" in setup
+    assert "async_at_started(hass, coordinator.async_start_after_hass)" in setup
+    assert "if self.hass.state is not CoreState.running:" in coordinator
+    assert "return self.startup_data()" in coordinator
+    assert "await self.async_request_refresh()" in coordinator
+
+
+def test_friendly_meter_names_are_discovered_and_used() -> None:
+    """SAPN descriptions label selectors and external statistics."""
+    config_flow = (INTEGRATION / "config_flow.py").read_text()
+    coordinator = (INTEGRATION / "coordinator.py").read_text()
+    constants = (INTEGRATION / "const.py").read_text()
+
+    assert "getNMIAssignments()" in config_flow
+    assert "assignment.friendly_name" in config_flow
+    assert "CONF_NMI_NAMES" in constants
+    assert "options=meter_options" in config_flow
+    assert "statistic_name(nmi, direction, friendly_name)" in coordinator

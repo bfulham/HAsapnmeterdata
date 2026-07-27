@@ -20,6 +20,7 @@ from homeassistant.helpers import selector
 from .const import (
     CONF_AVAILABLE_NMIS,
     CONF_CONSUMPTION_CHANNELS,
+    CONF_NMI_NAMES,
     CONF_NMIS,
     CONF_RETURN_CHANNELS,
     DEFAULT_CONSUMPTION_CHANNELS,
@@ -38,15 +39,22 @@ class CannotConnectError(Exception):
     """The SAPN portal could not be reached or queried."""
 
 
-def _discover_nmis(email: str, password: str) -> list[str]:
-    """Validate credentials and return assigned NMIs."""
+def _discover_nmis(
+    email: str,
+    password: str,
+) -> tuple[list[str], dict[str, str]]:
+    """Validate credentials and return NMIs with SAPN's friendly names."""
     # This function always runs in Home Assistant's executor. Keeping the
     # import here avoids importing pandas and the NEM12 parser on HA's event
     # loop merely because the user opened the config flow.
     from sapnmeterdata import AuthError, FetchError, LoginError, login
 
     try:
-        return [str(nmi) for nmi in login(email, password).getNMIs()]
+        assignments = login(email, password).getNMIAssignments()
+        return (
+            [assignment.nmi for assignment in assignments],
+            {assignment.nmi: assignment.friendly_name for assignment in assignments},
+        )
     except (AuthError, LoginError) as err:
         raise InvalidAuthError from err
     except FetchError as err:
@@ -75,6 +83,7 @@ def _credentials_schema() -> vol.Schema:
 
 def _meter_schema(
     available_nmis: list[str],
+    nmi_names: Mapping[str, str],
     defaults: Mapping[str, Any] | None = None,
 ) -> vol.Schema:
     """Return the meter and channel mapping schema."""
@@ -84,12 +93,23 @@ def _meter_schema(
     ]
     if not selected:
         selected = available_nmis
+    meter_options = [
+        {
+            "value": nmi,
+            "label": (
+                f"{friendly_name} ({nmi})"
+                if (friendly_name := nmi_names.get(nmi, nmi)) != nmi
+                else nmi
+            ),
+        }
+        for nmi in available_nmis
+    ]
 
     return vol.Schema(
         {
             vol.Required(CONF_NMIS, default=selected): selector.SelectSelector(
                 selector.SelectSelectorConfig(
-                    options=available_nmis,
+                    options=meter_options,
                     multiple=True,
                     mode=selector.SelectSelectorMode.DROPDOWN,
                 )
@@ -122,6 +142,7 @@ class SAPNMeterDataConfigFlow(ConfigFlow, domain=DOMAIN):
         self._email = ""
         self._password = ""
         self._available_nmis: list[str] = []
+        self._nmi_names: dict[str, str] = {}
 
     @staticmethod
     @callback
@@ -141,10 +162,11 @@ class SAPNMeterDataConfigFlow(ConfigFlow, domain=DOMAIN):
             self._email = user_input[CONF_EMAIL].strip()
             self._password = user_input[CONF_PASSWORD]
             try:
-                self._available_nmis = await self.hass.async_add_executor_job(
-                    _discover_nmis,
-                    self._email,
-                    self._password,
+                (
+                    self._available_nmis,
+                    self._nmi_names,
+                ) = await self.hass.async_add_executor_job(
+                    _discover_nmis, self._email, self._password
                 )
             except InvalidAuthError:
                 errors["base"] = "invalid_auth"
@@ -190,6 +212,7 @@ class SAPNMeterDataConfigFlow(ConfigFlow, domain=DOMAIN):
                         CONF_PASSWORD: self._password,
                         CONF_AVAILABLE_NMIS: self._available_nmis,
                         CONF_NMIS: user_input[CONF_NMIS],
+                        CONF_NMI_NAMES: self._nmi_names,
                         CONF_CONSUMPTION_CHANNELS: user_input[
                             CONF_CONSUMPTION_CHANNELS
                         ],
@@ -199,7 +222,10 @@ class SAPNMeterDataConfigFlow(ConfigFlow, domain=DOMAIN):
 
         return self.async_show_form(
             step_id="meters",
-            data_schema=_meter_schema(self._available_nmis),
+            data_schema=_meter_schema(
+                self._available_nmis,
+                self._nmi_names,
+            ),
             errors=errors,
         )
 
@@ -220,7 +246,7 @@ class SAPNMeterDataConfigFlow(ConfigFlow, domain=DOMAIN):
         email = entry.data[CONF_EMAIL]
         if user_input is not None:
             try:
-                nmis = await self.hass.async_add_executor_job(
+                nmis, nmi_names = await self.hass.async_add_executor_job(
                     _discover_nmis,
                     email,
                     user_input[CONF_PASSWORD],
@@ -238,6 +264,7 @@ class SAPNMeterDataConfigFlow(ConfigFlow, domain=DOMAIN):
                     data_updates={
                         CONF_PASSWORD: user_input[CONF_PASSWORD],
                         CONF_AVAILABLE_NMIS: nmis,
+                        CONF_NMI_NAMES: nmi_names,
                     },
                 )
 
@@ -264,6 +291,7 @@ class SAPNMeterDataOptionsFlow(OptionsFlow):
     def __init__(self) -> None:
         """Initialize the options flow."""
         self._available_nmis: list[str] | None = None
+        self._nmi_names: dict[str, str] | None = None
 
     @override
     async def async_step_init(
@@ -276,7 +304,10 @@ class SAPNMeterDataOptionsFlow(OptionsFlow):
 
         if self._available_nmis is None:
             try:
-                self._available_nmis = await self.hass.async_add_executor_job(
+                (
+                    self._available_nmis,
+                    self._nmi_names,
+                ) = await self.hass.async_add_executor_job(
                     _discover_nmis,
                     self.config_entry.data[CONF_EMAIL],
                     self.config_entry.data[CONF_PASSWORD],
@@ -296,15 +327,30 @@ class SAPNMeterDataOptionsFlow(OptionsFlow):
                 self.config_entry.data[CONF_NMIS],
             )
         ]
+        nmi_names = self._nmi_names or {
+            str(nmi): str(name) for nmi, name in current.get(CONF_NMI_NAMES, {}).items()
+        }
+        for nmi in available_nmis:
+            nmi_names.setdefault(nmi, nmi)
 
         if user_input is not None:
             if not user_input[CONF_NMIS]:
                 errors["base"] = "select_nmi"
             else:
-                return self.async_create_entry(title="", data=user_input)
+                return self.async_create_entry(
+                    title="",
+                    data={
+                        **user_input,
+                        CONF_NMI_NAMES: nmi_names,
+                    },
+                )
 
         return self.async_show_form(
             step_id="init",
-            data_schema=_meter_schema(available_nmis, current),
+            data_schema=_meter_schema(
+                available_nmis,
+                nmi_names,
+                current,
+            ),
             errors=errors,
         )

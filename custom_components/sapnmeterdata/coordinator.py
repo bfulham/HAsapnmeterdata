@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any, Literal, override
@@ -20,7 +20,7 @@ from homeassistant.components.recorder.statistics import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD, UnitOfEnergy
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import CoreState, HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers import storage
 from homeassistant.helpers.event import async_call_later, async_track_point_in_utc_time
@@ -28,6 +28,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 
 from .const import (
     CONF_CONSUMPTION_CHANNELS,
+    CONF_NMI_NAMES,
     CONF_NMIS,
     CONF_RETURN_CHANNELS,
     DAILY_REFRESH_TIME,
@@ -96,6 +97,8 @@ class FetchBatch:
     streams: dict[str, dict[str, Any]] = field(default_factory=dict)
     no_data: dict[str, str] = field(default_factory=dict)
     errors: dict[str, str] = field(default_factory=dict)
+    meter_names: dict[str, str] = field(default_factory=dict)
+    assignment_error: str | None = None
 
 
 def _fetch_meter_data(
@@ -104,6 +107,7 @@ def _fetch_meter_data(
     targets: dict[str, LocalDateRange],
     consumption_channels: str,
     return_channels: str,
+    discover_meter_names: bool,
 ) -> FetchBatch:
     """Fetch and transform date ranges without blocking HA's event loop."""
     from sapnmeterdata import (
@@ -125,6 +129,17 @@ def _fetch_meter_data(
         raise PortalFetchError(str(err)) from err
 
     result = FetchBatch()
+    if discover_meter_names:
+        try:
+            result.meter_names = {
+                assignment.nmi: assignment.friendly_name
+                for assignment in client.getNMIAssignments()
+            }
+        except (AuthError, LoginError) as err:
+            raise PortalAuthError(str(err)) from err
+        except FetchError as err:
+            result.assignment_error = str(err)
+
     for nmi, target in targets.items():
         # Adelaide midnight falls on a UTC half hour. Fetch the preceding local
         # day so the first UTC-aligned hour has all its source intervals.
@@ -186,6 +201,65 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._unsub_daily_refresh: Callable[[], None] | None = None
         self._unsub_backfill_refresh: Callable[[], None] | None = None
 
+    @staticmethod
+    def _meter_name_map(
+        nmis: list[str],
+        *sources: Mapping[str, Any],
+    ) -> dict[str, str]:
+        """Return non-empty friendly names with an NMI fallback."""
+        names = {nmi: nmi for nmi in nmis}
+        for source in sources:
+            for nmi in nmis:
+                value = str(source.get(nmi, "")).strip()
+                if value:
+                    names[nmi] = value
+        return names
+
+    @callback
+    def startup_data(self) -> dict[str, Any]:
+        """Return safe placeholder data while Home Assistant is starting."""
+        config = {**self._entry.data, **self._entry.options}
+        nmis = [str(nmi) for nmi in config[CONF_NMIS]]
+        meter_names = self._meter_name_map(
+            nmis,
+            config.get(CONF_NMI_NAMES, {}),
+        )
+        available_day = latest_available_date(
+            datetime.now(UTC),
+            SAPN_TIME_ZONE,
+            DATA_AVAILABLE_TIME,
+        )
+        return {
+            "status": STATUS_WAITING,
+            "latest_available_day": available_day.isoformat(),
+            "requested_dates": {},
+            "request_type": None,
+            "imported": [],
+            "waiting": [],
+            "skipped": [],
+            "errors": {},
+            "channels": {},
+            "statistics": {},
+            "meter_names": meter_names,
+            "last_processed": {},
+            "earliest_processed": {},
+            "historical_backfill": {
+                "active": False,
+                "chunk_days": HISTORICAL_CHUNK_DAYS,
+                "before": {},
+                "completed": [],
+                "failed": {},
+                "chunks_imported": 0,
+            },
+            "last_successful_import": None,
+            "startup_pending": True,
+        }
+
+    async def async_start_after_hass(self, _hass: HomeAssistant) -> None:
+        """Run the first portal and Recorder work after bootstrap completes."""
+        self.async_start_daily_refresh()
+        await self.async_request_refresh()
+
     @callback
     def async_start_daily_refresh(self) -> None:
         """Schedule a refresh just after SAPN publishes the previous day."""
@@ -246,6 +320,7 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._state = dict(loaded or {})
             self._state.setdefault("last_processed", {})
             self._state.setdefault("earliest_processed", {})
+            self._state.setdefault("meter_names", {})
             self._state.setdefault(
                 "historical_backfill",
                 {
@@ -377,6 +452,7 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self,
         config: dict[str, Any],
         targets: dict[str, LocalDateRange],
+        discover_meter_names: bool,
     ) -> FetchBatch:
         """Fetch one forward or historical batch."""
         try:
@@ -390,6 +466,7 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     DEFAULT_CONSUMPTION_CHANNELS,
                 ),
                 config.get(CONF_RETURN_CHANNELS, DEFAULT_RETURN_CHANNELS),
+                discover_meter_names,
             )
         except PortalAuthError as err:
             raise ConfigEntryAuthFailed(str(err)) from err
@@ -449,6 +526,7 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         direction: str,
         points: tuple[HourlyPoint, ...],
         mode: Literal["forward", "backfill"],
+        friendly_name: str,
     ) -> str:
         """Import one consumption or return-to-grid stream."""
         stat_id = statistic_id(nmi, direction)
@@ -471,7 +549,7 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         metadata: StatisticMetaData = {
             "mean_type": StatisticMeanType.NONE,
             "has_sum": True,
-            "name": statistic_name(nmi, direction),
+            "name": statistic_name(nmi, direction, friendly_name),
             "source": DOMAIN,
             "statistic_id": stat_id,
             "unit_class": "energy",
@@ -497,13 +575,40 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "chunks_imported": int(backfill.get("chunks_imported", 0)),
         }
 
+    @staticmethod
+    def _merge_meter_names(
+        state: dict[str, Any],
+        meter_names: dict[str, str],
+        discovered_names: Mapping[str, str],
+    ) -> bool:
+        """Merge newly discovered friendly names into memory and storage."""
+        stored_names = state.setdefault("meter_names", {})
+        changed = False
+        for nmi in meter_names:
+            friendly_name = str(discovered_names.get(nmi, "")).strip()
+            if not friendly_name:
+                continue
+            meter_names[nmi] = friendly_name
+            if stored_names.get(nmi) != friendly_name:
+                stored_names[nmi] = friendly_name
+                changed = True
+        return changed
+
     @override
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch the newest day or one rate-limited historical chunk."""
+        if self.hass.state is not CoreState.running:
+            return self.startup_data()
+
         state = await self._async_load_state()
         config = {**self._entry.data, **self._entry.options}
         nmis = [str(nmi) for nmi in config[CONF_NMIS]]
         await self._async_migrate_statistics_alignment(state, nmis)
+        meter_names = self._meter_name_map(
+            nmis,
+            state.get("meter_names", {}),
+            config.get(CONF_NMI_NAMES, {}),
+        )
 
         last_processed: dict[str, str] = state["last_processed"]
         earliest_processed: dict[str, str] = state["earliest_processed"]
@@ -539,15 +644,38 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "errors": {},
             "channels": {},
             "statistics": {},
+            "meter_names": dict(meter_names),
+            "name_discovery_error": None,
             "last_processed": dict(last_processed),
             "earliest_processed": dict(earliest_processed),
             "historical_backfill": self._backfill_snapshot(state),
             "last_successful_import": state.get("last_successful_import"),
         }
+        discover_meter_names = any(meter_names[nmi] == nmi for nmi in nmis)
         if not targets:
+            if not discover_meter_names:
+                return base_result
+            batch = await self._async_fetch_ranges(
+                config,
+                {},
+                True,
+            )
+            if self._merge_meter_names(state, meter_names, batch.meter_names):
+                await self._store.async_save(state)
+            base_result["meter_names"] = dict(meter_names)
+            base_result["name_discovery_error"] = batch.assignment_error
             return base_result
 
-        batch = await self._async_fetch_ranges(config, targets)
+        batch = await self._async_fetch_ranges(
+            config,
+            targets,
+            discover_meter_names,
+        )
+        state_changed = self._merge_meter_names(
+            state,
+            meter_names,
+            batch.meter_names,
+        )
         imported: list[str] = []
         waiting: list[str] = []
         skipped: list[str] = []
@@ -555,7 +683,6 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         channels: dict[str, dict[str, list[str]]] = {}
         statistics: dict[str, dict[str, str]] = {}
         queued_statistics = False
-        state_changed = False
         backfill_progress = False
 
         if mode == "forward":
@@ -615,6 +742,7 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     direction,
                     stream.points,
                     mode,
+                    meter_names[nmi],
                 )
                 queued_statistics = True
             imported.append(nmi)
@@ -645,6 +773,7 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "type": mode,
                 "dates": requested_dates,
                 "nmis": imported,
+                "meter_names": {nmi: meter_names[nmi] for nmi in imported},
                 "channels": channels,
                 "statistics": statistics,
             }
@@ -696,6 +825,8 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "errors": errors,
                 "channels": channels,
                 "statistics": statistics,
+                "meter_names": dict(meter_names),
+                "name_discovery_error": batch.assignment_error,
                 "last_processed": dict(last_processed),
                 "earliest_processed": dict(earliest_processed),
                 "historical_backfill": self._backfill_snapshot(state),

@@ -6,25 +6,31 @@ statistics. The resulting grid-consumption and return-to-grid statistics can be
 selected directly in the Energy Dashboard.
 
 This integration uses
-[`sapnmeterdata`](https://pypi.org/project/sapnmeterdata/) 0.3.2.
+[`sapnmeterdata`](https://pypi.org/project/sapnmeterdata/) 0.3.3.
 
-Version 0.2.4 aligns SAPN readings to Home Assistant's UTC statistics hours,
-adds a resumable historical import, and runs the one-time statistics migration
-on Home Assistant's dedicated Recorder thread. It continues to use
-`sapnmeterdata` 0.3.2, which avoids a native Polars runtime and is compatible
-with Home Assistant's pinned pandas installation.
+Version 0.2.5 waits until Home Assistant has finished starting before it
+accesses Recorder or the SAPN portal. It also reads each meter's description
+from SAPN and uses that friendly name throughout the integration while keeping
+the existing NMI-based statistic IDs.
 
-## Upgrading to 0.2.4
+## Upgrading to 0.2.5
 
 Versions 0.2.0–0.2.2 wrote Adelaide clock-hour timestamps. Adelaide's
 half-hour UTC offset meant those readings did not line up with Home Assistant's
 native solar statistics, causing grid and consumed-solar bars to alternate.
 
-On its first successful start, 0.2.4 automatically removes those misaligned SAPN rows and
-reimports the latest available day on UTC hour boundaries. The statistic IDs do
-not change, so existing Energy Dashboard selections are preserved. Use the
-**Update historical data** button afterward to restore all older available
-history in the corrected format.
+Version 0.2.5 automatically removes those misaligned SAPN rows and reimports
+the latest available day on UTC hour boundaries. This migration now begins
+only after Home Assistant reaches its running state, avoiding the startup wait
+that could occur in 0.2.4 when Recorder had not begun processing queued work.
+Use the **Update historical data** button afterward to restore all older
+available history in the corrected format.
+
+SAPN meter descriptions now appear in the meter selector, status sensor, and
+external statistic names. For example, `MRC` is shown instead of
+`20023157519`. The statistic ID remains
+`sapnmeterdata:20023157519_consumption`, so existing Energy Dashboard
+selections and imported history are preserved.
 
 Existing 0.1.x config entries are also migrated automatically. Each old entry
 keeps its configured email, password, and NMI. Open **Configure** afterward to
@@ -32,7 +38,7 @@ refresh the account's NMI list and select additional meters.
 
 ## What it does
 
-- Discovers the NMIs assigned to an SAPN portal account.
+- Discovers assigned NMIs and their SAPN meter descriptions.
 - Imports SAPN's latest completed Adelaide calendar day.
 - Combines matching NEM12 channels:
   - `E*` is grid consumption by default.
@@ -83,7 +89,8 @@ under your Home Assistant configuration directory, then restart Home Assistant.
 2. Select **Add integration** and search for
    **SA Power Networks Meter Data**.
 3. Enter the email and password used for the SAPN meter-data portal.
-4. Select one or more NMIs.
+4. Select one or more meters. The list shows SAPN's friendly description and
+   NMI so similarly named meters can still be distinguished.
 5. Keep the defaults unless your NEM12 channels use different directions:
    - Grid consumption: `E*`
    - Return to grid: `B*`
@@ -96,9 +103,9 @@ After the first successful import:
 
 1. Go to **Settings → Dashboards → Energy**.
 2. Under **Electricity grid**, choose **Add consumption**.
-3. Select `SAPN <NMI> Grid consumption`.
+3. Select `SAPN <friendly name> Grid consumption`.
 4. If the meter exports energy, add **Return to grid** and select
-   `SAPN <NMI> Return to grid`.
+   `SAPN <friendly name> Return to grid`.
 5. Add a tariff entity only if you want Home Assistant to calculate cost.
 
 The external statistic IDs are:
@@ -139,7 +146,9 @@ makes available before the integration's earliest recorded day.
 
 The **Import status** sensor shows `Updating historical data` while work
 remains. Its `historical_backfill` attribute contains each NMI's checkpoint,
-the completed and failed NMIs, and the number of imported chunks.
+the completed and failed NMIs, and the number of imported chunks. Its
+`meter_names` attribute maps each stable NMI to the friendly name returned by
+SAPN.
 
 ## Channel mapping
 
@@ -162,7 +171,7 @@ Statistics**.
 ## Development
 
 ```bash
-python -m pip install pandas pytest ruff
+python -m pip install "pandas==2.3.3" pytest ruff sapnmeterdata==0.3.3
 ruff check .
 python -m compileall -q custom_components
 pytest

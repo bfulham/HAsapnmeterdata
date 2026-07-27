@@ -7,6 +7,7 @@ from collections.abc import Iterable
 from datetime import UTC, datetime
 
 import pandas as pd
+from pytz.exceptions import AmbiguousTimeError
 
 from .statistics import HourlyPoint, HourlyStream
 
@@ -36,11 +37,23 @@ def _hourly_points(
     """Aggregate intervals into Home Assistant's UTC-aligned hours."""
     index = pd.DatetimeIndex(pd.to_datetime(series.index))
     if index.tz is None:
-        index = index.tz_localize(
-            timezone_name,
-            ambiguous="infer",
-            nonexistent="shift_forward",
-        )
+        try:
+            index = index.tz_localize(
+                timezone_name,
+                ambiguous="infer",
+                nonexistent="shift_forward",
+            )
+        except AmbiguousTimeError:
+            # NEM12 always contains a fixed number of intervals per date.
+            # Some parser output therefore contains only one copy of the
+            # repeated wall-clock hour when daylight saving ends, leaving
+            # pandas nothing from which to infer the offset. Preserve those
+            # readings by assigning the lone ambiguous hour to standard time.
+            index = index.tz_localize(
+                timezone_name,
+                ambiguous=False,
+                nonexistent="shift_forward",
+            )
     else:
         index = index.tz_convert(timezone_name)
 

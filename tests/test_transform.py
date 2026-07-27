@@ -255,6 +255,35 @@ def test_daylight_saving_days_have_the_correct_hour_count(
     assert len(streams["E1"].points) == expected_hours
 
 
+def test_unique_nem12_intervals_survive_adelaide_dst_fallback() -> None:
+    """A fixed 288-interval NEM12 day must not raise AmbiguousTimeError."""
+    target_start = date(2026, 4, 5)
+    target_end = date(2026, 4, 6)
+    index = pd.date_range(
+        "2026-04-04",
+        target_end,
+        freq="5min",
+        inclusive="left",
+    )
+    window_start, window_end = utc_statistic_window(
+        target_start,
+        target_end,
+        "Australia/Adelaide",
+    )
+
+    streams = extract_hourly_channels(
+        _frame(index),
+        "20023157519",
+        ("E1",),
+        "Australia/Adelaide",
+        window_start,
+        window_end,
+    )
+
+    assert len(streams["E1"].points) == 25
+    assert sum(point.value for point in streams["E1"].points) == pytest.approx(28.8)
+
+
 def test_new_stream_gets_a_baseline_and_continuous_sum() -> None:
     """The first imported hour has a previous point for Energy Dashboard delta."""
     points = (

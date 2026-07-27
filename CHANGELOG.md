@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.1
+
+- Handle NEM12 parser output containing one copy of Adelaide's repeated
+  daylight-saving fallback hour instead of raising `AmbiguousTimeError`.
+- Preserve all 288 five-minute readings on 5 April 2026 by assigning a lone
+  ambiguous 2:00 am hour to standard time.
+- Retain pandas' normal offset inference when the parser supplies both copies
+  of a repeated wall-clock hour.
+
 ## 0.3.0
 
 - Discover the actual NEM12 channels for every selected meter from a bounded

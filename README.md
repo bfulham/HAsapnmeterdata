@@ -8,9 +8,10 @@ selected directly in the Energy Dashboard.
 This integration uses
 [`sapnmeterdata`](https://pypi.org/project/sapnmeterdata/) 0.3.3.
 
-Version 0.3.0 imports every selected NEM12 channel as its own statistic.
-Channels are discovered from a bounded recent sample and can be named and
-classified separately for every meter.
+Version 0.3.0 introduced separate statistics for every selected NEM12 channel.
+Version 0.3.1 fixes historical imports that cross the Adelaide daylight-saving
+fallback hour. Channels are discovered from a bounded recent sample and can be
+named and classified separately for every meter.
 
 ## Upgrading to 0.3.0
 

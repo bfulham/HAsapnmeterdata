@@ -7,11 +7,11 @@ ROOT = Path(__file__).parents[1]
 INTEGRATION = ROOT / "custom_components" / "sapnmeterdata"
 
 
-def test_manifest_is_the_per_channel_030_update() -> None:
+def test_manifest_is_the_dst_safe_031_update() -> None:
     """The release preserves the domain and pins the tested portal client."""
     manifest = json.loads((INTEGRATION / "manifest.json").read_text())
     assert manifest["domain"] == "sapnmeterdata"
-    assert manifest["version"] == "0.3.0"
+    assert manifest["version"] == "0.3.1"
     assert manifest["config_flow"] is True
     assert "recorder" in manifest["dependencies"]
     assert manifest["requirements"] == ["sapnmeterdata==0.3.3"]

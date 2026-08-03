@@ -9,6 +9,7 @@ from .const import (
     CONF_AVAILABLE_NMIS,
     CONF_CHANNEL_CONFIG,
     CONF_CONSUMPTION_CHANNELS,
+    CONF_EXCLUDED_NMIS,
     CONF_NMI_NAMES,
     CONF_NMIS,
     CONF_RETURN_CHANNELS,
@@ -21,7 +22,7 @@ PLATFORMS = [Platform.SENSOR, Platform.BUTTON]
 
 async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Migrate old aggregate-channel entries to per-channel configuration."""
-    if entry.version > 3:
+    if entry.version > 4:
         return False
 
     data = dict(entry.data)
@@ -42,10 +43,13 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     if entry.version < 3:
         data.setdefault(CONF_CHANNEL_CONFIG, {})
+
+    if entry.version < 4:
+        data.setdefault(CONF_EXCLUDED_NMIS, {})
         hass.config_entries.async_update_entry(
             entry,
             data=data,
-            version=3,
+            version=4,
             unique_id=unique_id,
         )
     return True

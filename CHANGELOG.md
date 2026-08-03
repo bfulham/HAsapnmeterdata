@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.3.2
+
+- Use the meter-type metadata already exposed by `sapnmeterdata==0.3.3` to
+  identify interval-capable assignments.
+- Exclude SAPN assignments described as basic or manually read meters from
+  setup, options, daily imports, and historical backfilling.
+- Automatically discover and persist exclusions for existing config entries.
+- Show excluded NMIs, friendly names, and meter types on the Import status
+  sensor.
+- Resume an active historical backfill after the non-interval meter blocking
+  the forward queue is excluded.
+- Keep a per-NMI forward checkpoint on missing or partially published SAPN
+  data instead of permanently skipping the affected date.
+- Reconcile the previous seven days once during upgrade to recover dates an
+  earlier release may already have skipped.
+- Continue multi-day forward catch-up at the bounded one-minute chunk cadence.
+
 ## 0.3.1
 
 - Handle NEM12 parser output containing one copy of Adelaide's repeated

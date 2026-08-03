@@ -10,8 +10,10 @@ This integration uses
 
 Version 0.3.0 introduced separate statistics for every selected NEM12 channel.
 Version 0.3.1 fixes historical imports that cross the Adelaide daylight-saving
-fallback hour. Channels are discovered from a bounded recent sample and can be
-named and classified separately for every meter.
+fallback hour. Version 0.3.2 automatically excludes basic and manually read
+meters that cannot provide interval history. Channels are discovered from a
+bounded recent sample and can be named and classified separately for every
+interval-capable meter.
 
 ## Upgrading to 0.3.0
 
@@ -37,6 +39,7 @@ useful name.
 ## What it does
 
 - Discovers assigned NMIs and their SAPN meter descriptions.
+- Excludes assignments identified by SAPN as basic or manually read meters.
 - Discovers the actual NEM12 channels returned for each selected meter.
 - Imports every enabled channel separately.
 - Lets each NMI/channel pair have its own name and classification.
@@ -47,8 +50,10 @@ useful name.
 - Aligns every imported row to Home Assistant's UTC hour boundaries so grid,
   solar, and return-to-grid values share the same Energy Dashboard bars.
 - Maintains continuous cumulative kWh totals for Energy Dashboard reporting.
-- Retries delayed data without creating duplicate rows.
-- Catches up one day at a time after Home Assistant has been offline.
+- Rejects partially published days and retries delayed NMIs without creating
+  duplicate rows.
+- Catches up one day at a time after Home Assistant has been offline, with
+  one-minute follow-up runs while completed dates remain queued.
 - Backfills older portal history in bounded, resumable seven-day chunks.
 
 SAPN's portal is not a documented public API, so portal changes can temporarily
@@ -88,8 +93,10 @@ under your Home Assistant configuration directory, then restart Home Assistant.
 2. Select **Add integration** and search for
    **SA Power Networks Meter Data**.
 3. Enter the email and password used for the SAPN meter-data portal.
-4. Select one or more meters. The list shows SAPN's friendly description and
-   NMI so similarly named meters can still be distinguished.
+4. Select one or more interval-capable meters. The list shows SAPN's friendly
+   description and NMI so similarly named meters can still be distinguished.
+   Basic or manually read meters are listed as automatically excluded because
+   they cannot provide the interval history required by the Energy Dashboard.
 5. Wait while the integration inspects a recent 14-day sample for each selected
    meter.
 6. For every discovered channel:
@@ -129,9 +136,21 @@ Home Assistant updates rows with the same statistic ID and hour instead of
 adding duplicates.
 
 If Home Assistant missed several days, the integration catches up one day per
-three-hour refresh. SAPN data unavailable for the newest eligible day is
-retried. An older permanently unavailable day is skipped so later dates are not
-blocked.
+bounded request and schedules one-minute follow-up runs while completed dates
+remain queued. A missing or partially published day remains at that NMI's
+checkpoint and is retried; it is never marked processed merely because newer
+days are available. Other NMIs keep their own checkpoints and continue
+independently.
+
+On the first 0.3.2 refresh, existing checkpoints are rewound by seven days so
+recent dates that older versions may have skipped are safely reconciled. The
+statistics import is idempotent, so readings already present are updated rather
+than duplicated.
+
+Assignments described by SAPN as **Basic Meter** or **Manual Meter** are
+excluded before data retrieval. Existing entries learn this classification
+during their next refresh, so a non-interval meter cannot remain permanently
+in the forward queue or prevent historical backfilling.
 
 The **Import previous day** button requests an immediate check. Before 3:00 am
 it still respects SAPN's availability cutoff and will not request yesterday

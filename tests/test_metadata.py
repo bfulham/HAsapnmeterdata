@@ -7,11 +7,11 @@ ROOT = Path(__file__).parents[1]
 INTEGRATION = ROOT / "custom_components" / "sapnmeterdata"
 
 
-def test_manifest_is_the_dst_safe_031_update() -> None:
+def test_manifest_is_the_interval_meter_only_032_update() -> None:
     """The release preserves the domain and pins the tested portal client."""
     manifest = json.loads((INTEGRATION / "manifest.json").read_text())
     assert manifest["domain"] == "sapnmeterdata"
-    assert manifest["version"] == "0.3.1"
+    assert manifest["version"] == "0.3.2"
     assert manifest["config_flow"] is True
     assert "recorder" in manifest["dependencies"]
     assert manifest["requirements"] == ["sapnmeterdata==0.3.3"]
@@ -24,15 +24,17 @@ def test_english_translation_matches_strings() -> None:
     assert english == strings
 
 
-def test_config_flow_and_migration_use_version_three() -> None:
+def test_config_flow_and_migration_use_version_four() -> None:
     """Old aggregate entries have an explicit per-channel migration path."""
     config_flow = (INTEGRATION / "config_flow.py").read_text()
     setup = (INTEGRATION / "__init__.py").read_text()
-    assert "VERSION = 3" in config_flow
+    assert "VERSION = 4" in config_flow
     assert "async_migrate_entry" in setup
     assert "entry.version == 1" in setup
     assert "entry.version < 3" in setup
+    assert "entry.version < 4" in setup
     assert "CONF_CHANNEL_CONFIG" in setup
+    assert "CONF_EXCLUDED_NMIS" in setup
 
 
 def test_opening_config_flow_does_not_import_the_data_stack() -> None:
@@ -116,3 +118,34 @@ def test_channels_are_discovered_named_and_imported_separately() -> None:
     assert "for channel, stream in streams.items()" in coordinator
     assert "streams[channel] = HourlyStream" in transform
     assert "safe_channel" in statistics
+
+
+def test_basic_meters_are_excluded_before_interval_fetching() -> None:
+    """Basic/manual assignments cannot hold up forward or historical imports."""
+    config_flow = (INTEGRATION / "config_flow.py").read_text()
+    coordinator = (INTEGRATION / "coordinator.py").read_text()
+    meters = (INTEGRATION / "meters.py").read_text()
+
+    assert "supports_interval_data(assignment) is not False" in config_flow
+    assert "supports_interval_data(assignment) is False" in config_flow
+    assert "if nmi in result.excluded_nmis:" in coordinator
+    assert 'state.setdefault("excluded_nmis", {})' in coordinator
+    assert "imported or ignored or excluded" in coordinator
+    assert "_NON_INTERVAL_METER_MARKERS" in meters
+
+
+def test_incomplete_daily_nmis_are_retried_without_advancing_checkpoints() -> None:
+    """Partial or unavailable daily responses cannot be permanently skipped."""
+    coordinator = (INTEGRATION / "coordinator.py").read_text()
+    transform = (INTEGRATION / "transform.py").read_text()
+    constants = (INTEGRATION / "const.py").read_text()
+
+    no_data_block = coordinator.split(
+        "for nmi, message in batch.no_data.items():",
+        maxsplit=1,
+    )[1].split("else:", maxsplit=1)[0]
+    assert "waiting.append(nmi)" in no_data_block
+    assert "last_processed[nmi]" not in no_data_block
+    assert "_async_migrate_forward_retries" in coordinator
+    assert "FORWARD_RECOVERY_DAYS = 7" in constants
+    assert "stream_covers_window" in transform

@@ -33,6 +33,7 @@ from .const import (
     CONF_CHANNEL_NAME,
     CONF_CHANNEL_TYPE,
     CONF_CONSUMPTION_CHANNELS,
+    CONF_EXCLUDED_NMIS,
     CONF_NMI_NAMES,
     CONF_NMIS,
     CONF_RETURN_CHANNELS,
@@ -41,6 +42,8 @@ from .const import (
     DEFAULT_CONSUMPTION_CHANNELS,
     DEFAULT_RETURN_CHANNELS,
     DOMAIN,
+    FORWARD_RECOVERY_DAYS,
+    FORWARD_RETRY_VERSION,
     HISTORICAL_CHUNK_DAYS,
     HISTORICAL_CHUNK_DELAY,
     LOGGER,
@@ -55,6 +58,7 @@ from .const import (
     STORE_VERSION,
     UPDATE_INTERVAL,
 )
+from .meters import meter_type_label, supports_interval_data
 from .schedule import (
     historical_chunk,
     latest_available_date,
@@ -103,6 +107,7 @@ class FetchBatch:
     no_data: dict[str, str] = field(default_factory=dict)
     errors: dict[str, str] = field(default_factory=dict)
     meter_names: dict[str, str] = field(default_factory=dict)
+    excluded_nmis: dict[str, str] = field(default_factory=dict)
     channel_config: dict[str, dict[str, dict[str, str]]] = field(default_factory=dict)
     ignored: set[str] = field(default_factory=set)
     assignment_error: str | None = None
@@ -115,7 +120,7 @@ def _fetch_meter_data(
     consumption_channels: str,
     return_channels: str,
     channel_config: Mapping[str, Any],
-    discover_meter_names: bool,
+    discover_assignments: bool,
 ) -> FetchBatch:
     """Fetch and transform date ranges without blocking HA's event loop."""
     from sapnmeterdata import (
@@ -127,7 +132,11 @@ def _fetch_meter_data(
         meter,
     )
 
-    from .transform import available_channels, extract_hourly_channels
+    from .transform import (
+        available_channels,
+        extract_hourly_channels,
+        stream_covers_window,
+    )
 
     try:
         client = login(email, password)
@@ -137,11 +146,16 @@ def _fetch_meter_data(
         raise PortalFetchError(str(err)) from err
 
     result = FetchBatch()
-    if discover_meter_names:
+    if discover_assignments:
         try:
+            assignments = client.getNMIAssignments()
             result.meter_names = {
-                assignment.nmi: assignment.friendly_name
-                for assignment in client.getNMIAssignments()
+                assignment.nmi: assignment.friendly_name for assignment in assignments
+            }
+            result.excluded_nmis = {
+                assignment.nmi: meter_type_label(assignment)
+                for assignment in assignments
+                if supports_interval_data(assignment) is False
             }
         except (AuthError, LoginError) as err:
             raise PortalAuthError(str(err)) from err
@@ -149,6 +163,8 @@ def _fetch_meter_data(
             result.assignment_error = str(err)
 
     for nmi, target in targets.items():
+        if nmi in result.excluded_nmis:
+            continue
         # Adelaide midnight falls on a UTC half hour. Fetch the preceding local
         # day so the first UTC-aligned hour has all its source intervals.
         request_start = datetime.combine(
@@ -185,7 +201,7 @@ def _fetch_meter_data(
                     result.ignored.add(nmi)
                     result.streams[nmi] = {}
                     continue
-                result.streams[nmi] = extract_hourly_channels(
+                streams = extract_hourly_channels(
                     frame,
                     nmi,
                     selected_channels,
@@ -193,6 +209,29 @@ def _fetch_meter_data(
                     window_start,
                     window_end,
                 )
+                missing_channels = sorted(set(selected_channels) - set(streams))
+                incomplete_channels = sorted(
+                    channel
+                    for channel, stream in streams.items()
+                    if not stream_covers_window(stream, window_start, window_end)
+                )
+                if missing_channels or incomplete_channels:
+                    details: list[str] = []
+                    if missing_channels:
+                        details.append(
+                            "missing channel(s): " + ", ".join(missing_channels)
+                        )
+                    if incomplete_channels:
+                        details.append(
+                            "partial channel(s): " + ", ".join(incomplete_channels)
+                        )
+                    result.no_data[nmi] = (
+                        "SAPN returned incomplete interval data ("
+                        + "; ".join(details)
+                        + ")."
+                    )
+                    continue
+                result.streams[nmi] = streams
             except (TypeError, ValueError) as err:
                 result.errors[nmi] = str(err)
     return result
@@ -240,9 +279,14 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def startup_data(self) -> dict[str, Any]:
         """Return safe placeholder data while Home Assistant is starting."""
         config = {**self._entry.data, **self._entry.options}
-        nmis = [str(nmi) for nmi in config[CONF_NMIS]]
+        configured_nmis = [str(nmi) for nmi in config[CONF_NMIS]]
+        excluded_nmis = {
+            str(nmi): str(meter_type)
+            for nmi, meter_type in config.get(CONF_EXCLUDED_NMIS, {}).items()
+        }
+        nmis = [nmi for nmi in configured_nmis if nmi not in excluded_nmis]
         meter_names = self._meter_name_map(
-            nmis,
+            configured_nmis,
             config.get(CONF_NMI_NAMES, {}),
         )
         channel_config = merge_channel_config(
@@ -270,12 +314,21 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "request_type": None,
             "imported": [],
             "waiting": [],
+            "waiting_details": {},
             "skipped": [],
             "ignored": [],
+            "excluded": sorted(excluded_nmis),
+            "excluded_meters": {
+                nmi: {
+                    "name": meter_names[nmi],
+                    "meter_type": meter_type,
+                }
+                for nmi, meter_type in excluded_nmis.items()
+            },
             "errors": {},
             "channels": {},
             "statistics": {},
-            "meter_names": meter_names,
+            "meter_names": {nmi: meter_names[nmi] for nmi in nmis},
             "channel_config": channel_config,
             "last_processed": {},
             "earliest_processed": {},
@@ -357,6 +410,7 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._state.setdefault("last_processed", {})
             self._state.setdefault("earliest_processed", {})
             self._state.setdefault("meter_names", {})
+            self._state.setdefault("excluded_nmis", {})
             self._state.setdefault("channel_config", {})
             self._state.setdefault(
                 "historical_backfill",
@@ -369,6 +423,39 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 },
             )
         return self._state
+
+    async def _async_migrate_forward_retries(
+        self,
+        state: dict[str, Any],
+        nmis: list[str],
+    ) -> None:
+        """Recheck recent dates once after replacing permanent skips with retries."""
+        if state.get("forward_retry_version") == FORWARD_RETRY_VERSION:
+            return
+
+        last_processed = state["last_processed"]
+        rewound: dict[str, str] = {}
+        for nmi in nmis:
+            stored = last_processed.get(nmi)
+            if not stored:
+                continue
+            try:
+                processed_date = date.fromisoformat(stored)
+            except ValueError:
+                continue
+            checkpoint = processed_date - timedelta(days=FORWARD_RECOVERY_DAYS)
+            last_processed[nmi] = checkpoint.isoformat()
+            rewound[nmi] = checkpoint.isoformat()
+
+        state["forward_retry_version"] = FORWARD_RETRY_VERSION
+        await self._store.async_save(state)
+        if rewound:
+            LOGGER.info(
+                "Rewound %d SAPN forward checkpoint(s) by %d days to recover "
+                "dates skipped by earlier versions",
+                len(rewound),
+                FORWARD_RECOVERY_DAYS,
+            )
 
     async def _async_migrate_statistics_alignment(
         self,
@@ -488,7 +575,18 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Start or restart the resumable historical import."""
         state = await self._async_load_state()
         config = {**self._entry.data, **self._entry.options}
-        nmis = [str(nmi) for nmi in config[CONF_NMIS]]
+        configured_nmis = [str(nmi) for nmi in config[CONF_NMIS]]
+        excluded_nmis = {
+            **{
+                str(nmi): str(meter_type)
+                for nmi, meter_type in config.get(CONF_EXCLUDED_NMIS, {}).items()
+            },
+            **{
+                str(nmi): str(meter_type)
+                for nmi, meter_type in state.get("excluded_nmis", {}).items()
+            },
+        }
+        nmis = [nmi for nmi in configured_nmis if nmi not in excluded_nmis]
         available_day = latest_available_date(
             datetime.now(UTC),
             SAPN_TIME_ZONE,
@@ -515,7 +613,7 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self,
         config: dict[str, Any],
         targets: dict[str, LocalDateRange],
-        discover_meter_names: bool,
+        discover_assignments: bool,
         channel_config: Mapping[str, Any],
     ) -> FetchBatch:
         """Fetch one forward or historical batch."""
@@ -531,7 +629,7 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 ),
                 config.get(CONF_RETURN_CHANNELS, DEFAULT_RETURN_CHANNELS),
                 channel_config,
-                discover_meter_names,
+                discover_assignments,
             )
         except PortalAuthError as err:
             raise ConfigEntryAuthFailed(str(err)) from err
@@ -666,6 +764,28 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return changed
 
     @staticmethod
+    def _merge_excluded_nmis(
+        state: dict[str, Any],
+        excluded_nmis: dict[str, str],
+        discovered_exclusions: Mapping[str, str],
+    ) -> bool:
+        """Persist non-interval assignments discovered from the portal."""
+        stored_exclusions = state.setdefault("excluded_nmis", {})
+        changed = False
+        for nmi, meter_type in discovered_exclusions.items():
+            label = str(meter_type).strip() or "Non-interval meter"
+            excluded_nmis[nmi] = label
+            if stored_exclusions.get(nmi) != label:
+                stored_exclusions[nmi] = label
+                LOGGER.info(
+                    "Excluding SAPN meter %s because it is a %s",
+                    nmi,
+                    label,
+                )
+                changed = True
+        return changed
+
+    @staticmethod
     def _merge_channel_definitions(
         state: dict[str, Any],
         channel_config: dict[str, dict[str, dict[str, str]]],
@@ -698,14 +818,26 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         state = await self._async_load_state()
         config = {**self._entry.data, **self._entry.options}
-        nmis = [str(nmi) for nmi in config[CONF_NMIS]]
+        configured_nmis = [str(nmi) for nmi in config[CONF_NMIS]]
+        excluded_nmis = {
+            **{
+                str(nmi): str(meter_type)
+                for nmi, meter_type in config.get(CONF_EXCLUDED_NMIS, {}).items()
+            },
+            **{
+                str(nmi): str(meter_type)
+                for nmi, meter_type in state.get("excluded_nmis", {}).items()
+            },
+        }
+        nmis = [nmi for nmi in configured_nmis if nmi not in excluded_nmis]
         await self._async_migrate_statistics_alignment(state, nmis)
         await self._async_handle_channel_config_change(
             state,
             config.get(CONF_CHANNEL_CONFIG, {}),
         )
+        await self._async_migrate_forward_retries(state, nmis)
         meter_names = self._meter_name_map(
-            nmis,
+            configured_nmis,
             state.get("meter_names", {}),
             config.get(CONF_NMI_NAMES, {}),
         )
@@ -754,12 +886,21 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "request_type": mode if targets else None,
             "imported": [],
             "waiting": [],
+            "waiting_details": {},
             "skipped": [],
             "ignored": [],
+            "excluded": sorted(excluded_nmis),
+            "excluded_meters": {
+                nmi: {
+                    "name": meter_names[nmi],
+                    "meter_type": meter_type,
+                }
+                for nmi, meter_type in excluded_nmis.items()
+            },
             "errors": {},
             "channels": {},
             "statistics": {},
-            "meter_names": dict(meter_names),
+            "meter_names": {nmi: meter_names[nmi] for nmi in nmis},
             "channel_config": channel_config,
             "name_discovery_error": None,
             "last_processed": dict(last_processed),
@@ -767,9 +908,9 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "historical_backfill": self._backfill_snapshot(state),
             "last_successful_import": state.get("last_successful_import"),
         }
-        discover_meter_names = any(meter_names[nmi] == nmi for nmi in nmis)
+        discover_meter_names = any(meter_names[nmi] == nmi for nmi in configured_nmis)
         if not targets:
-            if not discover_meter_names:
+            if not discover_meter_names and state.get("assignments_checked"):
                 return base_result
             batch = await self._async_fetch_ranges(
                 config,
@@ -777,16 +918,49 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 True,
                 channel_config,
             )
-            if self._merge_meter_names(state, meter_names, batch.meter_names):
+            state_changed = self._merge_meter_names(
+                state,
+                meter_names,
+                batch.meter_names,
+            )
+            state_changed = (
+                self._merge_excluded_nmis(
+                    state,
+                    excluded_nmis,
+                    batch.excluded_nmis,
+                )
+                or state_changed
+            )
+            if batch.assignment_error is None:
+                state["assignments_checked"] = True
+                state_changed = True
+            if state_changed:
                 await self._store.async_save(state)
-            base_result["meter_names"] = dict(meter_names)
+            base_result["excluded"] = sorted(excluded_nmis)
+            base_result["excluded_meters"] = {
+                nmi: {
+                    "name": meter_names[nmi],
+                    "meter_type": meter_type,
+                }
+                for nmi, meter_type in excluded_nmis.items()
+            }
+            base_result["meter_names"] = {
+                nmi: meter_names[nmi]
+                for nmi in configured_nmis
+                if nmi not in excluded_nmis
+            }
+            base_result["channel_config"] = {
+                nmi: definitions
+                for nmi, definitions in channel_config.items()
+                if nmi not in excluded_nmis
+            }
             base_result["name_discovery_error"] = batch.assignment_error
             return base_result
 
         batch = await self._async_fetch_ranges(
             config,
             targets,
-            discover_meter_names,
+            True,
             channel_config,
         )
         state_changed = self._merge_meter_names(
@@ -794,6 +968,17 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             meter_names,
             batch.meter_names,
         )
+        state_changed = (
+            self._merge_excluded_nmis(
+                state,
+                excluded_nmis,
+                batch.excluded_nmis,
+            )
+            or state_changed
+        )
+        if batch.assignment_error is None:
+            state["assignments_checked"] = True
+            state_changed = True
         state_changed = (
             self._merge_channel_definitions(
                 state,
@@ -806,6 +991,7 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         waiting: list[str] = []
         skipped: list[str] = []
         ignored = sorted(batch.ignored)
+        excluded = sorted(batch.excluded_nmis)
         errors = dict(batch.errors)
         channels: dict[str, dict[str, dict[str, str]]] = {}
         statistics: dict[str, dict[str, str]] = {}
@@ -813,6 +999,13 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         backfill_progress = False
 
         if mode == "forward":
+            for nmi in excluded:
+                last_processed.pop(nmi, None)
+                earliest_processed.pop(nmi, None)
+                backfill = state["historical_backfill"]
+                backfill.setdefault("before", {}).pop(nmi, None)
+                backfill.setdefault("failed", {}).pop(nmi, None)
+                state_changed = True
             for nmi in ignored:
                 target_date = targets[nmi].start
                 last_processed[nmi] = target_date.isoformat()
@@ -823,23 +1016,20 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 state_changed = True
             for nmi, message in batch.no_data.items():
                 target_date = targets[nmi].start
-                if target_date < available_day:
-                    skipped.append(nmi)
-                    last_processed[nmi] = target_date.isoformat()
-                    state_changed = True
-                    LOGGER.warning(
-                        "Skipping unavailable SAPN data for NMI %s on %s: %s",
-                        nmi,
-                        target_date,
-                        message,
-                    )
-                else:
-                    waiting.append(nmi)
+                waiting.append(nmi)
+                LOGGER.warning(
+                    "SAPN data for NMI %s on %s is not complete; retaining the "
+                    "checkpoint so it will be retried: %s",
+                    nmi,
+                    target_date,
+                    message,
+                )
         else:
             backfill = state["historical_backfill"]
             completed = set(backfill.get("completed", []))
             completed.update(ignored)
-            if ignored:
+            completed.update(excluded)
+            if ignored or excluded:
                 backfill_progress = True
                 state_changed = True
             for nmi, message in batch.no_data.items():
@@ -930,8 +1120,13 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._unsub_backfill_refresh()
                 self._unsub_backfill_refresh = None
         elif state["historical_backfill"].get("active") and (
-            imported or skipped or ignored
+            imported or ignored or excluded
         ):
+            self._schedule_backfill_refresh()
+        elif imported and self._target_dates(nmis, last_processed, available_day):
+            # A one-time recovery rewind or a long outage can leave several
+            # forward dates queued. Continue at the same bounded cadence used
+            # by historical chunks instead of waiting three hours per day.
             self._schedule_backfill_refresh()
 
         if state_changed or imported:
@@ -946,6 +1141,7 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             and not waiting
             and not skipped
             and not ignored
+            and not excluded
         ):
             details = "; ".join(f"{nmi}: {error}" for nmi, error in errors.items())
             raise UpdateFailed(details)
@@ -964,13 +1160,30 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "status": status,
                 "imported": imported,
                 "waiting": waiting,
+                "waiting_details": dict(batch.no_data),
                 "skipped": skipped,
                 "ignored": ignored,
+                "excluded": sorted(excluded_nmis),
+                "excluded_meters": {
+                    nmi: {
+                        "name": meter_names[nmi],
+                        "meter_type": meter_type,
+                    }
+                    for nmi, meter_type in excluded_nmis.items()
+                },
                 "errors": errors,
                 "channels": channels,
                 "statistics": statistics,
-                "meter_names": dict(meter_names),
-                "channel_config": channel_config,
+                "meter_names": {
+                    nmi: meter_names[nmi]
+                    for nmi in configured_nmis
+                    if nmi not in excluded_nmis
+                },
+                "channel_config": {
+                    nmi: definitions
+                    for nmi, definitions in channel_config.items()
+                    if nmi not in excluded_nmis
+                },
                 "name_discovery_error": batch.assignment_error,
                 "last_processed": dict(last_processed),
                 "earliest_processed": dict(earliest_processed),

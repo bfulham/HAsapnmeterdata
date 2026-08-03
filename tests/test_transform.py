@@ -2,9 +2,9 @@
 
 import importlib.util
 import sys
-from datetime import UTC, date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -35,9 +35,11 @@ def _load_component_module(name: str) -> ModuleType:
 statistics = _load_component_module("statistics")
 schedule = _load_component_module("schedule")
 channels = _load_component_module("channels")
+meters = _load_component_module("meters")
 transform = _load_component_module("transform")
 
 HourlyPoint = statistics.HourlyPoint
+HourlyStream = statistics.HourlyStream
 build_statistics = statistics.build_statistics
 default_channel_type = channels.default_channel_type
 derive_base_sum = statistics.derive_base_sum
@@ -47,11 +49,14 @@ extract_hourly_channels = transform.extract_hourly_channels
 historical_chunk = schedule.historical_chunk
 latest_available_date = schedule.latest_available_date
 merge_channel_config = channels.merge_channel_config
+meter_type_label = meters.meter_type_label
 next_daily_refresh = schedule.next_daily_refresh
 normalize_channel_config = channels.normalize_channel_config
 parse_patterns = channels.parse_patterns
 statistic_id = statistics.statistic_id
 statistic_name = statistics.statistic_name
+supports_interval_data = meters.supports_interval_data
+stream_covers_window = transform.stream_covers_window
 utc_statistic_window = schedule.utc_statistic_window
 
 ADELAIDE = ZoneInfo("Australia/Adelaide")
@@ -203,6 +208,40 @@ def test_same_channel_code_can_have_a_different_name_per_meter() -> None:
     assert config["NMI1"]["E2"]["name"] == "Controlled Load"
     assert config["NMI1"]["B1"]["name"] == "Solar"
     assert config["NMI2"]["E1"]["name"] == "Pump Station"
+
+
+def test_basic_meters_are_excluded_and_interval_meters_are_supported() -> None:
+    """Portal meter-type descriptions distinguish interval data capability."""
+    basic = SimpleNamespace(
+        meter_type="E",
+        meter_type_description="Basic Meter",
+    )
+    interval = SimpleNamespace(
+        meter_type="E2",
+        meter_type_description="Interval Meter",
+    )
+    unknown = SimpleNamespace(meter_type=None, meter_type_description=None)
+
+    assert supports_interval_data(basic) is False
+    assert supports_interval_data(interval) is True
+    assert supports_interval_data(unknown) is None
+    assert meter_type_label(basic) == "Basic Meter"
+
+
+def test_partial_daily_stream_does_not_cover_the_requested_window() -> None:
+    """A partially published newest day must remain queued for retry."""
+    window_start = datetime(2026, 7, 27, tzinfo=UTC)
+    window_end = datetime(2026, 7, 28, tzinfo=UTC)
+    complete = HourlyStream(
+        points=tuple(
+            HourlyPoint(window_start + timedelta(hours=hour), 1.0) for hour in range(24)
+        ),
+        channels=("E1",),
+    )
+    partial = HourlyStream(points=complete.points[:-1], channels=("E1",))
+
+    assert stream_covers_window(complete, window_start, window_end)
+    assert not stream_covers_window(partial, window_start, window_end)
 
 
 def test_adelaide_half_hour_is_aligned_to_utc_statistics() -> None:

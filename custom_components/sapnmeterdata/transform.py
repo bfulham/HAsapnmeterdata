@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pandas as pd
 from pytz.exceptions import AmbiguousTimeError
@@ -110,3 +110,23 @@ def extract_hourly_channels(
         if points:
             streams[channel] = HourlyStream(points=points, channels=(channel,))
     return streams
+
+
+def stream_covers_window(
+    stream: HourlyStream,
+    window_start: datetime,
+    window_end: datetime,
+) -> bool:
+    """Return whether a stream reaches both ends of a requested window.
+
+    SAPN can briefly publish only part of the newest day for some NMIs. The
+    coordinator must not advance that NMI's checkpoint until the first and
+    final UTC-aligned hours are present. We intentionally do not require a
+    fixed number of hours because Adelaide daylight-saving transitions can
+    produce unusual NEM12 interval sequences.
+    """
+    if not stream.points or window_end <= window_start:
+        return False
+
+    starts = {point.start for point in stream.points}
+    return window_start in starts and window_end - timedelta(hours=1) in starts

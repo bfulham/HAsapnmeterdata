@@ -30,6 +30,7 @@ from .const import (
     CONF_CHANNEL_NAME,
     CONF_CHANNEL_TYPE,
     CONF_CONSUMPTION_CHANNELS,
+    CONF_EXCLUDED_NMIS,
     CONF_NMI_NAMES,
     CONF_NMIS,
     CONF_RETURN_CHANNELS,
@@ -39,6 +40,7 @@ from .const import (
     DOMAIN,
     SAPN_TIME_ZONE,
 )
+from .meters import meter_type_label, supports_interval_data
 from .schedule import latest_available_date
 
 _LOGGER = logging.getLogger(__name__)
@@ -55,7 +57,7 @@ class CannotConnectError(Exception):
 def _connect_account(
     email: str,
     password: str,
-) -> tuple[Any, list[str], dict[str, str]]:
+) -> tuple[Any, list[str], dict[str, str], dict[str, str]]:
     """Validate credentials and return a reusable client and meter metadata."""
     # These imports stay inside the executor worker so opening Add Integration
     # does not load pandas and the NEM12 parser on Home Assistant's event loop.
@@ -64,10 +66,20 @@ def _connect_account(
     try:
         client = login(email, password)
         assignments = client.getNMIAssignments()
+        supported_assignments = [
+            assignment
+            for assignment in assignments
+            if supports_interval_data(assignment) is not False
+        ]
         return (
             client,
-            [assignment.nmi for assignment in assignments],
+            [assignment.nmi for assignment in supported_assignments],
             {assignment.nmi: assignment.friendly_name for assignment in assignments},
+            {
+                assignment.nmi: meter_type_label(assignment)
+                for assignment in assignments
+                if supports_interval_data(assignment) is False
+            },
         )
     except (AuthError, LoginError) as err:
         raise InvalidAuthError from err
@@ -150,6 +162,19 @@ def _meter_label(nmi: str, nmi_names: Mapping[str, str]) -> str:
     """Return an unambiguous meter label."""
     friendly_name = str(nmi_names.get(nmi, nmi)).strip() or nmi
     return f"{friendly_name} ({nmi})" if friendly_name != nmi else nmi
+
+
+def _excluded_meter_summary(
+    excluded_nmis: Mapping[str, str],
+    nmi_names: Mapping[str, str],
+) -> str:
+    """Return a concise list of automatically excluded basic meters."""
+    if not excluded_nmis:
+        return "No basic or manually read meters were found."
+    return "Excluded automatically: " + ", ".join(
+        f"{_meter_label(nmi, nmi_names)} — {meter_type}"
+        for nmi, meter_type in sorted(excluded_nmis.items())
+    )
 
 
 def _meter_schema(
@@ -300,7 +325,7 @@ def _discovery_warning(
 class SAPNMeterDataConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle an SA Power Networks Meter Data config flow."""
 
-    VERSION = 3
+    VERSION = 4
 
     def __init__(self) -> None:
         """Initialize the flow."""
@@ -308,6 +333,7 @@ class SAPNMeterDataConfigFlow(ConfigFlow, domain=DOMAIN):
         self._password = ""
         self._client: Any | None = None
         self._available_nmis: list[str] = []
+        self._excluded_nmis: dict[str, str] = {}
         self._nmi_names: dict[str, str] = {}
         self._selected_nmis: list[str] = []
         self._channel_config: dict[str, dict[str, dict[str, str]]] = {}
@@ -339,6 +365,7 @@ class SAPNMeterDataConfigFlow(ConfigFlow, domain=DOMAIN):
                     self._client,
                     self._available_nmis,
                     self._nmi_names,
+                    self._excluded_nmis,
                 ) = await self.hass.async_add_executor_job(
                     _connect_account,
                     self._email,
@@ -353,7 +380,9 @@ class SAPNMeterDataConfigFlow(ConfigFlow, domain=DOMAIN):
                 errors["base"] = "unknown"
             else:
                 if not self._available_nmis:
-                    errors["base"] = "no_nmis"
+                    errors["base"] = (
+                        "no_interval_nmis" if self._excluded_nmis else "no_nmis"
+                    )
                 elif any(
                     str(entry.data.get(CONF_EMAIL, "")).casefold()
                     == self._email.casefold()
@@ -411,6 +440,12 @@ class SAPNMeterDataConfigFlow(ConfigFlow, domain=DOMAIN):
                 {CONF_NMIS: self._selected_nmis or self._available_nmis},
             ),
             errors=errors,
+            description_placeholders={
+                "excluded_meters": _excluded_meter_summary(
+                    self._excluded_nmis,
+                    self._nmi_names,
+                )
+            },
         )
 
     async def async_step_channels(
@@ -435,6 +470,7 @@ class SAPNMeterDataConfigFlow(ConfigFlow, domain=DOMAIN):
                     CONF_EMAIL: self._email,
                     CONF_PASSWORD: self._password,
                     CONF_AVAILABLE_NMIS: self._available_nmis,
+                    CONF_EXCLUDED_NMIS: self._excluded_nmis,
                     CONF_NMIS: self._selected_nmis,
                     CONF_NMI_NAMES: self._nmi_names,
                     CONF_CHANNEL_CONFIG: channel_config,
@@ -471,7 +507,12 @@ class SAPNMeterDataConfigFlow(ConfigFlow, domain=DOMAIN):
         email = entry.data[CONF_EMAIL]
         if user_input is not None:
             try:
-                _, nmis, nmi_names = await self.hass.async_add_executor_job(
+                (
+                    _,
+                    nmis,
+                    nmi_names,
+                    excluded_nmis,
+                ) = await self.hass.async_add_executor_job(
                     _connect_account,
                     email,
                     user_input[CONF_PASSWORD],
@@ -489,6 +530,7 @@ class SAPNMeterDataConfigFlow(ConfigFlow, domain=DOMAIN):
                     data_updates={
                         CONF_PASSWORD: user_input[CONF_PASSWORD],
                         CONF_AVAILABLE_NMIS: nmis,
+                        CONF_EXCLUDED_NMIS: excluded_nmis,
                         CONF_NMI_NAMES: nmi_names,
                     },
                 )
@@ -517,6 +559,7 @@ class SAPNMeterDataOptionsFlow(OptionsFlow):
         """Initialize the options flow."""
         self._client: Any | None = None
         self._available_nmis: list[str] | None = None
+        self._excluded_nmis: dict[str, str] | None = None
         self._nmi_names: dict[str, str] | None = None
         self._selected_nmis: list[str] = []
         self._channel_config: dict[str, dict[str, dict[str, str]]] = {}
@@ -541,6 +584,7 @@ class SAPNMeterDataOptionsFlow(OptionsFlow):
                     self._client,
                     self._available_nmis,
                     self._nmi_names,
+                    self._excluded_nmis,
                 ) = await self.hass.async_add_executor_job(
                     _connect_account,
                     self.config_entry.data[CONF_EMAIL],
@@ -554,19 +598,37 @@ class SAPNMeterDataOptionsFlow(OptionsFlow):
                 _LOGGER.exception("Unexpected error refreshing SAPN NMIs")
                 errors["base"] = "unknown"
 
-        available_nmis = self._available_nmis or [
-            str(nmi)
-            for nmi in self.config_entry.data.get(
-                CONF_AVAILABLE_NMIS,
-                self.config_entry.data[CONF_NMIS],
-            )
-        ]
-        nmi_names = self._nmi_names or {
-            str(nmi): str(name) for nmi, name in current.get(CONF_NMI_NAMES, {}).items()
-        }
+        available_nmis = (
+            self._available_nmis
+            if self._available_nmis is not None
+            else [
+                str(nmi)
+                for nmi in self.config_entry.data.get(
+                    CONF_AVAILABLE_NMIS,
+                    self.config_entry.data[CONF_NMIS],
+                )
+            ]
+        )
+        nmi_names = (
+            self._nmi_names
+            if self._nmi_names is not None
+            else {
+                str(nmi): str(name)
+                for nmi, name in current.get(CONF_NMI_NAMES, {}).items()
+            }
+        )
         for nmi in available_nmis:
             nmi_names.setdefault(nmi, nmi)
         self._nmi_names = nmi_names
+        excluded_nmis = (
+            self._excluded_nmis
+            if self._excluded_nmis is not None
+            else {
+                str(nmi): str(meter_type)
+                for nmi, meter_type in current.get(CONF_EXCLUDED_NMIS, {}).items()
+            }
+        )
+        self._excluded_nmis = excluded_nmis
 
         if user_input is not None:
             if not user_input[CONF_NMIS]:
@@ -613,6 +675,12 @@ class SAPNMeterDataOptionsFlow(OptionsFlow):
                 current,
             ),
             errors=errors,
+            description_placeholders={
+                "excluded_meters": _excluded_meter_summary(
+                    excluded_nmis,
+                    nmi_names,
+                )
+            },
         )
 
     async def async_step_channels(
@@ -638,6 +706,7 @@ class SAPNMeterDataOptionsFlow(OptionsFlow):
                 data={
                     CONF_NMIS: self._selected_nmis,
                     CONF_NMI_NAMES: nmi_names,
+                    CONF_EXCLUDED_NMIS: self._excluded_nmis or {},
                     CONF_CHANNEL_CONFIG: channel_config,
                     CONF_CONSUMPTION_CHANNELS: current.get(
                         CONF_CONSUMPTION_CHANNELS,

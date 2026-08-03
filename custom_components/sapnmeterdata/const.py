@@ -8,6 +8,7 @@ LOGGER = logging.getLogger(__package__)
 MANUFACTURER = "SA Power Networks"
 
 CONF_AVAILABLE_NMIS = "available_nmis"
+CONF_EXCLUDED_NMIS = "excluded_nmis"
 CONF_NMIS = "nmis"
 CONF_NMI_NAMES = "nmi_names"
 CONF_CHANNEL_CONFIG = "channel_config"
@@ -37,6 +38,8 @@ DAILY_REFRESH_TIME = time(hour=3, minute=5)
 UPDATE_INTERVAL = timedelta(hours=3)
 HISTORICAL_CHUNK_DAYS = 7
 HISTORICAL_CHUNK_DELAY = timedelta(minutes=1)
+FORWARD_RECOVERY_DAYS = 7
+FORWARD_RETRY_VERSION = 1
 STATISTICS_ALIGNMENT_VERSION = 3
 STORE_VERSION = 1
 

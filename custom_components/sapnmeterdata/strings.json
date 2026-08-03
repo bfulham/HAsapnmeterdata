@@ -12,7 +12,7 @@
       },
       "meters": {
         "title": "Choose meters",
-        "description": "Select the SAPN meters to import. Home Assistant will inspect a recent 14-day sample to find each meter's NEM12 channels.",
+        "description": "Select the interval-capable SAPN meters to import. Basic and manually read meters cannot provide interval history and are excluded. Home Assistant will inspect a recent 14-day sample to find each selected meter's NEM12 channels. {excluded_meters}",
         "data": {
           "nmis": "Meters"
         }
@@ -33,6 +33,7 @@
       "cannot_connect": "Could not connect to the SAPN portal.",
       "invalid_auth": "The SAPN credentials were rejected.",
       "no_nmis": "No NMIs were assigned to this SAPN account.",
+      "no_interval_nmis": "This SAPN account has no interval-capable meters. Basic and manually read meters cannot provide Energy Dashboard history.",
       "select_nmi": "Select at least one NMI.",
       "channel_discovery": "The selected meters' channels could not be inspected. Try again.",
       "unknown": "Unexpected error."
@@ -46,7 +47,7 @@
     "step": {
       "init": {
         "title": "SA Power Networks Meter Data options",
-        "description": "Choose which SAPN meters are imported. Their recent NEM12 channels will be inspected on the next step.",
+        "description": "Choose which interval-capable SAPN meters are imported. Basic and manually read meters are excluded automatically. Their recent NEM12 channels will be inspected on the next step. {excluded_meters}",
         "data": {
           "nmis": "Meters"
         }

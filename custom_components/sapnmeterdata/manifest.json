@@ -15,5 +15,5 @@
   "requirements": [
     "sapnmeterdata==0.3.3"
   ],
-  "version": "0.3.1"
+  "version": "0.3.2"
 }

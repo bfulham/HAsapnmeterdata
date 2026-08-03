@@ -21,9 +21,9 @@ Versions through 0.2.5 combined all matching E channels into one consumption
 statistic and all matching B channels into one return-to-grid statistic.
 Version 0.3.0 replaces those aggregate streams with stable NMI/channel pairs:
 
-- `sapnmeterdata:20023157519_e1`
-- `sapnmeterdata:20023157519_e2`
-- `sapnmeterdata:20023157519_b1`
+- `sapnmeterdata:<nmi>_e1`
+- `sapnmeterdata:<nmi>_e2`
+- `sapnmeterdata:<nmi>_b1`
 
 The one-time migration removes the old aggregate SAPN statistics and imports
 the latest available day using the new channel IDs. Existing Energy Dashboard

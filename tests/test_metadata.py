@@ -1,17 +1,18 @@
 """Repository metadata tests."""
 
 import json
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
 INTEGRATION = ROOT / "custom_components" / "sapnmeterdata"
 
 
-def test_manifest_is_the_interval_meter_only_032_update() -> None:
+def test_manifest_is_the_generic_excluded_meter_033_update() -> None:
     """The release preserves the domain and pins the tested portal client."""
     manifest = json.loads((INTEGRATION / "manifest.json").read_text())
     assert manifest["domain"] == "sapnmeterdata"
-    assert manifest["version"] == "0.3.2"
+    assert manifest["version"] == "0.3.3"
     assert manifest["config_flow"] is True
     assert "recorder" in manifest["dependencies"]
     assert manifest["requirements"] == ["sapnmeterdata==0.3.3"]
@@ -134,6 +135,16 @@ def test_basic_meters_are_excluded_before_interval_fetching() -> None:
     assert "_NON_INTERVAL_METER_MARKERS" in meters
 
 
+def test_excluded_meter_name_does_not_require_a_selected_nmi_entry() -> None:
+    """An excluded assignment may not exist in the selected interval list."""
+    coordinator = (INTEGRATION / "coordinator.py").read_text()
+
+    assert "known_nmis = list(dict.fromkeys([*configured_nmis, *excluded_nmis]))" in (
+        coordinator
+    )
+    assert '"name": meter_names.get(nmi, nmi)' in coordinator
+
+
 def test_incomplete_daily_nmis_are_retried_without_advancing_checkpoints() -> None:
     """Partial or unavailable daily responses cannot be permanently skipped."""
     coordinator = (INTEGRATION / "coordinator.py").read_text()
@@ -149,3 +160,19 @@ def test_incomplete_daily_nmis_are_retried_without_advancing_checkpoints() -> No
     assert "_async_migrate_forward_retries" in coordinator
     assert "FORWARD_RECOVERY_DAYS = 7" in constants
     assert "stream_covers_window" in transform
+
+
+def test_public_files_do_not_contain_account_specific_meter_identifiers() -> None:
+    """Release files must not embed a user's NMI or friendly meter name."""
+    public_text = "\n".join(
+        path.read_text()
+        for path in (
+            ROOT / "README.md",
+            ROOT / "CHANGELOG.md",
+            *INTEGRATION.rglob("*.py"),
+            *INTEGRATION.rglob("*.json"),
+            *(ROOT / "tests").rglob("*.py"),
+        )
+    )
+
+    assert re.search(r"\b2\d{10}\b", public_text) is None

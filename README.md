@@ -11,9 +11,10 @@ This integration uses
 Version 0.3.0 introduced separate statistics for every selected NEM12 channel.
 Version 0.3.1 fixes historical imports that cross the Adelaide daylight-saving
 fallback hour. Version 0.3.2 automatically excludes basic and manually read
-meters that cannot provide interval history. Channels are discovered from a
-bounded recent sample and can be named and classified separately for every
-interval-capable meter.
+meters that cannot provide interval history. Version 0.3.3 fixes status updates
+for accounts containing excluded meters and removes account-specific examples
+from the public project. Channels are discovered from a bounded recent sample
+and can be named and classified separately for every interval-capable meter.
 
 ## Upgrading to 0.3.0
 
@@ -21,9 +22,9 @@ Versions through 0.2.5 combined all matching E channels into one consumption
 statistic and all matching B channels into one return-to-grid statistic.
 Version 0.3.0 replaces those aggregate streams with stable NMI/channel pairs:
 
-- `sapnmeterdata:<nmi>_e1`
-- `sapnmeterdata:<nmi>_e2`
-- `sapnmeterdata:<nmi>_b1`
+- `sapnmeterdata:nmi_e1`
+- `sapnmeterdata:nmi_e2`
+- `sapnmeterdata:nmi_b1`
 
 The one-time migration removes the old aggregate SAPN statistics and imports
 the latest available day using the new channel IDs. Existing Energy Dashboard
@@ -119,9 +120,10 @@ After the first successful import:
 1. Go to **Settings → Dashboards → Energy**.
 2. Under **Electricity grid**, choose **Add consumption**.
 3. Add each consumption channel you want included, such as
-   `SAPN MRC Standard Consumption` and `SAPN MRC Controlled Load`.
+   `SAPN Example Meter Standard Consumption` and
+   `SAPN Example Meter Controlled Load`.
 4. Under **Return to grid**, select the named export channel, such as
-   `SAPN MRC Solar`.
+   `SAPN Example Meter Solar`.
 5. Add a tariff entity only if you want Home Assistant to calculate cost.
 
 External statistic IDs use
@@ -142,7 +144,7 @@ checkpoint and is retried; it is never marked processed merely because newer
 days are available. Other NMIs keep their own checkpoints and continue
 independently.
 
-On the first 0.3.2 refresh, existing checkpoints are rewound by seven days so
+On the first refresh after upgrading, existing checkpoints are rewound by seven days so
 recent dates that older versions may have skipped are safely reconciled. The
 statistics import is idempotent, so readings already present are updated rather
 than duplicated.

@@ -64,7 +64,7 @@ ADELAIDE = ZoneInfo("Australia/Adelaide")
 
 def _frame(index: pd.DatetimeIndex) -> pd.DataFrame:
     """Build representative five-minute NEM12 data."""
-    nmi = "20023157519"
+    nmi = "NMI0000001"
     return pd.DataFrame(
         {
             (nmi, "E1"): 0.10,
@@ -156,7 +156,7 @@ def test_interval_channels_remain_separate_and_aggregate_hourly() -> None:
     )
     streams = extract_hourly_channels(
         _frame(index),
-        "20023157519",
+        "NMI0000001",
         ("E1", "E2", "B1"),
         "Australia/Adelaide",
         window_start,
@@ -178,10 +178,10 @@ def test_interval_channels_remain_separate_and_aggregate_hourly() -> None:
 def test_channel_defaults_keep_reactive_registers_ignored() -> None:
     """E/B channels get safe energy defaults and K/Q remain ignored."""
     config = merge_channel_config(
-        ["20023157519"],
-        {"20023157519": ("E1", "E2", "B1", "K1", "Q1")},
+        ["NMI0000001"],
+        {"NMI0000001": ("E1", "E2", "B1", "K1", "Q1")},
     )
-    meter_config = config["20023157519"]
+    meter_config = config["NMI0000001"]
 
     assert default_channel_type("E1") == "consumption"
     assert default_channel_type("B1") == "return"
@@ -285,7 +285,7 @@ def test_daylight_saving_days_have_the_correct_hour_count(
     )
     streams = extract_hourly_channels(
         _frame(index),
-        "20023157519",
+        "NMI0000001",
         ("E1",),
         "Australia/Adelaide",
         window_start,
@@ -312,7 +312,7 @@ def test_unique_nem12_intervals_survive_adelaide_dst_fallback() -> None:
 
     streams = extract_hourly_channels(
         _frame(index),
-        "20023157519",
+        "NMI0000001",
         ("E1",),
         "Australia/Adelaide",
         window_start,
@@ -416,20 +416,23 @@ def test_historical_chunk_moves_back_seven_days() -> None:
 
 def test_statistic_id_preserves_the_existing_integration_domain() -> None:
     """Each NMI/channel pair gets a stable independent statistic ID."""
-    assert statistic_id("20023157519", "E1") == "sapnmeterdata:20023157519_e1"
-    assert statistic_id("20023157519", "E2") == "sapnmeterdata:20023157519_e2"
-    assert statistic_id("20023157519", "B1") == "sapnmeterdata:20023157519_b1"
+    assert statistic_id("NMI0000001", "E1") == "sapnmeterdata:nmi0000001_e1"
+    assert statistic_id("NMI0000001", "E2") == "sapnmeterdata:nmi0000001_e2"
+    assert statistic_id("NMI0000001", "B1") == "sapnmeterdata:nmi0000001_b1"
 
 
 def test_statistic_name_uses_the_sapn_friendly_meter_name() -> None:
     """Meter and user-supplied channel names are both user-facing."""
     assert (
         statistic_name(
-            "20023157519",
+            "NMI0000001",
             "E1",
-            "MRC",
+            "Example Meter",
             "Standard Consumption",
         )
-        == "SAPN MRC Standard Consumption"
+        == "SAPN Example Meter Standard Consumption"
     )
-    assert statistic_name("20023157519", "B1", "MRC", "Solar") == "SAPN MRC Solar"
+    assert (
+        statistic_name("NMI0000001", "B1", "Example Meter", "Solar")
+        == "SAPN Example Meter Solar"
+    )

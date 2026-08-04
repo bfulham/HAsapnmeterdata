@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.3
+
+- Fix a `KeyError` while building status details when an excluded assignment is
+  no longer present in the user's selected interval-meter list.
+- Resolve excluded-meter names generically with a safe NMI fallback; no meter
+  identifier is hard-coded in the integration.
+- Remove account-specific meter identifiers and friendly names from public
+  documentation and tests.
+
 ## 0.3.2
 
 - Use the meter-type metadata already exposed by `sapnmeterdata==0.3.3` to

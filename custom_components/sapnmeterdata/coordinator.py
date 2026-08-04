@@ -285,8 +285,9 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             for nmi, meter_type in config.get(CONF_EXCLUDED_NMIS, {}).items()
         }
         nmis = [nmi for nmi in configured_nmis if nmi not in excluded_nmis]
+        known_nmis = list(dict.fromkeys([*configured_nmis, *excluded_nmis]))
         meter_names = self._meter_name_map(
-            configured_nmis,
+            known_nmis,
             config.get(CONF_NMI_NAMES, {}),
         )
         channel_config = merge_channel_config(
@@ -320,7 +321,7 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "excluded": sorted(excluded_nmis),
             "excluded_meters": {
                 nmi: {
-                    "name": meter_names[nmi],
+                    "name": meter_names.get(nmi, nmi),
                     "meter_type": meter_type,
                 }
                 for nmi, meter_type in excluded_nmis.items()
@@ -830,6 +831,7 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             },
         }
         nmis = [nmi for nmi in configured_nmis if nmi not in excluded_nmis]
+        known_nmis = list(dict.fromkeys([*configured_nmis, *excluded_nmis]))
         await self._async_migrate_statistics_alignment(state, nmis)
         await self._async_handle_channel_config_change(
             state,
@@ -837,7 +839,7 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         await self._async_migrate_forward_retries(state, nmis)
         meter_names = self._meter_name_map(
-            configured_nmis,
+            known_nmis,
             state.get("meter_names", {}),
             config.get(CONF_NMI_NAMES, {}),
         )
@@ -892,7 +894,7 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "excluded": sorted(excluded_nmis),
             "excluded_meters": {
                 nmi: {
-                    "name": meter_names[nmi],
+                    "name": meter_names.get(nmi, nmi),
                     "meter_type": meter_type,
                 }
                 for nmi, meter_type in excluded_nmis.items()
@@ -939,7 +941,7 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             base_result["excluded"] = sorted(excluded_nmis)
             base_result["excluded_meters"] = {
                 nmi: {
-                    "name": meter_names[nmi],
+                    "name": meter_names.get(nmi, nmi),
                     "meter_type": meter_type,
                 }
                 for nmi, meter_type in excluded_nmis.items()
@@ -1166,7 +1168,7 @@ class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "excluded": sorted(excluded_nmis),
                 "excluded_meters": {
                     nmi: {
-                        "name": meter_names[nmi],
+                        "name": meter_names.get(nmi, nmi),
                         "meter_type": meter_type,
                     }
                     for nmi, meter_type in excluded_nmis.items()

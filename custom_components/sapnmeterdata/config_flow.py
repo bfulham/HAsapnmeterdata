@@ -2,730 +2,375 @@
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Mapping
-from datetime import UTC, datetime, time, timedelta
-from typing import Any, override
+from datetime import timedelta
+from typing import Any
 
 import voluptuous as vol
 from homeassistant.config_entries import (
-    ConfigEntry,
     ConfigFlow,
     ConfigFlowResult,
     OptionsFlow,
 )
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
-from homeassistant.core import callback
-from homeassistant.data_entry_flow import SectionConfig, section
-from homeassistant.helpers import selector
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.selector import (
+    SelectOptionDict,
+    SelectSelector,
+    SelectSelectorConfig,
+    SelectSelectorMode,
+    TextSelector,
+    TextSelectorConfig,
+    TextSelectorType,
+)
+from homeassistant.util import dt as dt_util
 
-from .channels import merge_channel_config
+from .channels import channel_settings
 from .const import (
-    CHANNEL_DISCOVERY_DAYS,
-    CHANNEL_TYPE_CONSUMPTION,
-    CHANNEL_TYPE_IGNORE,
-    CHANNEL_TYPE_RETURN,
-    CONF_AVAILABLE_NMIS,
-    CONF_CHANNEL_CONFIG,
+    CHANNEL_TYPES,
     CONF_CHANNEL_NAME,
     CONF_CHANNEL_TYPE,
-    CONF_CONSUMPTION_CHANNELS,
-    CONF_EXCLUDED_NMIS,
-    CONF_NMI_NAMES,
+    CONF_CHANNELS,
+    CONF_METER_NAMES,
     CONF_NMIS,
-    CONF_RETURN_CHANNELS,
-    DATA_AVAILABLE_TIME,
-    DEFAULT_CONSUMPTION_CHANNELS,
-    DEFAULT_RETURN_CHANNELS,
+    DISCOVERY_DAYS,
     DOMAIN,
-    SAPN_TIME_ZONE,
+    LOGGER,
 )
-from .meters import meter_type_label, supports_interval_data
-from .schedule import latest_available_date
+from .coordinator import SAPNConfigEntry, portal_session
+from .portal import (
+    MeterAssignment,
+    NEM12Error,
+    SAPNAuthError,
+    SAPNClient,
+    SAPNConnectionError,
+    SAPNLoginFailedError,
+    SAPNNoDataError,
+    SAPNPortalError,
+)
+from .series import summarize_nem12
+from .timing import latest_published_day
 
-_LOGGER = logging.getLogger(__name__)
+EMAIL_SELECTOR = TextSelector(
+    TextSelectorConfig(type=TextSelectorType.EMAIL, autocomplete="username")
+)
+PASSWORD_SELECTOR = TextSelector(
+    TextSelectorConfig(type=TextSelectorType.PASSWORD, autocomplete="current-password")
+)
+USER_SCHEMA = vol.Schema(
+    {
+        vol.Required(CONF_EMAIL): EMAIL_SELECTOR,
+        vol.Required(CONF_PASSWORD): PASSWORD_SELECTOR,
+    }
+)
+REAUTH_SCHEMA = vol.Schema({vol.Required(CONF_PASSWORD): PASSWORD_SELECTOR})
+CHANNEL_TYPE_SELECTOR = SelectSelector(
+    SelectSelectorConfig(
+        options=list(CHANNEL_TYPES),
+        translation_key="channel_type",
+        mode=SelectSelectorMode.DROPDOWN,
+    )
+)
 
 
-class InvalidAuthError(Exception):
-    """Credentials were rejected by the SAPN portal."""
+def _error_key(err: Exception) -> str:
+    """Map a portal error to a form error key."""
+    if isinstance(err, (SAPNAuthError, SAPNLoginFailedError)):
+        return "invalid_auth"
+    if isinstance(err, SAPNConnectionError):
+        return "cannot_connect"
+    if isinstance(err, SAPNPortalError):
+        return "portal_error"
+    LOGGER.exception("Unexpected error talking to the SAPN portal")
+    return "unknown"
 
 
-class CannotConnectError(Exception):
-    """The SAPN portal could not be reached or queried."""
-
-
-def _connect_account(
+async def _async_fetch_meters(
+    hass: HomeAssistant,
     email: str,
     password: str,
-) -> tuple[Any, list[str], dict[str, str], dict[str, str]]:
-    """Validate credentials and return a reusable client and meter metadata."""
-    # These imports stay inside the executor worker so opening Add Integration
-    # does not load pandas and the NEM12 parser on Home Assistant's event loop.
-    from sapnmeterdata import AuthError, FetchError, LoginError, login
-
-    try:
-        client = login(email, password)
-        assignments = client.getNMIAssignments()
-        supported_assignments = [
-            assignment
-            for assignment in assignments
-            if supports_interval_data(assignment) is not False
-        ]
-        return (
-            client,
-            [assignment.nmi for assignment in supported_assignments],
-            {assignment.nmi: assignment.friendly_name for assignment in assignments},
-            {
-                assignment.nmi: meter_type_label(assignment)
-                for assignment in assignments
-                if supports_interval_data(assignment) is False
-            },
-        )
-    except (AuthError, LoginError) as err:
-        raise InvalidAuthError from err
-    except FetchError as err:
-        raise CannotConnectError from err
+) -> list[MeterAssignment]:
+    with portal_session(hass) as session:
+        client = SAPNClient(session, email, password)
+        await client.login()
+        return await client.get_assignments()
 
 
-def _discover_channels(
-    client: Any,
+async def _async_discover_channels(
+    hass: HomeAssistant,
+    email: str,
+    password: str,
     nmis: list[str],
-) -> tuple[dict[str, tuple[str, ...]], dict[str, str]]:
-    """Read a bounded recent period and return channels found for each NMI."""
-    from sapnmeterdata import (
-        AuthError,
-        FetchError,
-        LoginError,
-        NoDataError,
-        meter,
-    )
+) -> dict[str, list[str]]:
+    """Return the energy channels in each meter's recent data.
 
-    available_day = latest_available_date(
-        datetime.now(UTC),
-        SAPN_TIME_ZONE,
-        DATA_AVAILABLE_TIME,
-    )
-    start = datetime.combine(
-        available_day - timedelta(days=CHANNEL_DISCOVERY_DAYS - 1),
-        time.min,
-    )
-    end = datetime.combine(available_day + timedelta(days=1), time.min)
-    discovered: dict[str, tuple[str, ...]] = {}
-    errors: dict[str, str] = {}
-
-    for nmi in nmis:
-        try:
-            frame = meter(nmi, client).getdata(start, end)
-            channels = {
-                str(column[1]).strip().upper()
-                for column in frame.columns
-                if len(column) >= 2
-                and str(column[0]) == str(nmi)
-                and str(column[1]).strip()
-            }
-            discovered[nmi] = tuple(sorted(channels))
-            if not channels:
-                errors[nmi] = "No NEM12 channels were present in the sample."
-        except (AuthError, LoginError) as err:
-            raise InvalidAuthError from err
-        except NoDataError as err:
-            discovered[nmi] = ()
-            errors[nmi] = str(err)
-        except (FetchError, TypeError, ValueError) as err:
-            discovered[nmi] = ()
-            errors[nmi] = str(err)
-
-    return discovered, errors
-
-
-def _credentials_schema() -> vol.Schema:
-    """Return the SAPN credentials form schema."""
-    return vol.Schema(
-        {
-            vol.Required(CONF_EMAIL): selector.TextSelector(
-                selector.TextSelectorConfig(
-                    type=selector.TextSelectorType.EMAIL,
-                    autocomplete="username",
+    A meter whose sample cannot be read gets no channels here; the default
+    channels are used once syncing finds its data.
+    """
+    last_day = latest_published_day(dt_util.utcnow())
+    first_day = last_day - timedelta(days=DISCOVERY_DAYS - 1)
+    found: dict[str, list[str]] = {}
+    with portal_session(hass) as session:
+        client = SAPNClient(session, email, password)
+        await client.login()
+        for nmi in nmis:
+            found[nmi] = []
+            try:
+                text = await client.download_nem12(nmi, first_day, last_day)
+                channels = await hass.async_add_executor_job(
+                    summarize_nem12, text, nmi, first_day, last_day
                 )
-            ),
-            vol.Required(CONF_PASSWORD): selector.TextSelector(
-                selector.TextSelectorConfig(
-                    type=selector.TextSelectorType.PASSWORD,
-                    autocomplete="current-password",
-                )
-            ),
-        }
-    )
+            except SAPNNoDataError:
+                continue
+            except SAPNLoginFailedError:
+                raise
+            except (SAPNPortalError, NEM12Error) as err:
+                LOGGER.warning("Could not read recent SAPN data for %s: %s", nmi, err)
+                continue
+            found[nmi] = sorted(channels)
+    return found
 
 
-def _meter_label(nmi: str, nmi_names: Mapping[str, str]) -> str:
-    """Return an unambiguous meter label."""
-    friendly_name = str(nmi_names.get(nmi, nmi)).strip() or nmi
-    return f"{friendly_name} ({nmi})" if friendly_name != nmi else nmi
+def _meter_label(meter: MeterAssignment) -> str:
+    return meter.nmi if meter.name == meter.nmi else f"{meter.name} ({meter.nmi})"
 
 
-def _excluded_meter_summary(
-    excluded_nmis: Mapping[str, str],
-    nmi_names: Mapping[str, str],
-) -> str:
-    """Return a concise list of automatically excluded basic meters."""
-    if not excluded_nmis:
-        return "No basic or manually read meters were found."
-    return "Excluded automatically: " + ", ".join(
-        f"{_meter_label(nmi, nmi_names)} — {meter_type}"
-        for nmi, meter_type in sorted(excluded_nmis.items())
-    )
+class _MeterSteps:
+    """Meter selection and channel naming shared by setup and options."""
 
+    hass: HomeAssistant
+    _email: str
+    _password: str
+    _defaults: Mapping[str, Any]
+    _meters: dict[str, MeterAssignment]
+    _excluded: list[MeterAssignment]
+    _selected: list[str]
+    _discovered: dict[str, list[str]]
+    _channels: dict[str, dict[str, dict[str, str]]]
+    _queue: list[str]
 
-def _meter_schema(
-    available_nmis: list[str],
-    nmi_names: Mapping[str, str],
-    defaults: Mapping[str, Any] | None = None,
-) -> vol.Schema:
-    """Return the meter selection schema."""
-    defaults = defaults or {}
-    selected = [
-        nmi for nmi in defaults.get(CONF_NMIS, available_nmis) if nmi in available_nmis
-    ]
-    if not selected:
-        selected = available_nmis
-    meter_options = [
-        {"value": nmi, "label": _meter_label(nmi, nmi_names)} for nmi in available_nmis
-    ]
-    return vol.Schema(
-        {
-            vol.Required(CONF_NMIS, default=selected): selector.SelectSelector(
-                selector.SelectSelectorConfig(
-                    options=meter_options,
-                    multiple=True,
-                    mode=selector.SelectSelectorMode.DROPDOWN,
-                )
-            )
-        }
-    )
-
-
-def _channel_type_selector() -> selector.SelectSelector:
-    """Return the channel-use selector."""
-    return selector.SelectSelector(
-        selector.SelectSelectorConfig(
-            options=[
-                {
-                    "value": CHANNEL_TYPE_CONSUMPTION,
-                    "label": "Grid consumption",
-                },
-                {
-                    "value": CHANNEL_TYPE_RETURN,
-                    "label": "Return to grid",
-                },
-                {"value": CHANNEL_TYPE_IGNORE, "label": "Ignore"},
-            ],
-            mode=selector.SelectSelectorMode.DROPDOWN,
-        )
-    )
-
-
-def _channel_schema(
-    nmis: list[str],
-    nmi_names: Mapping[str, str],
-    channel_config: Mapping[str, Mapping[str, Mapping[str, str]]],
-) -> tuple[
-    vol.Schema,
-    dict[str, tuple[str, dict[str, tuple[str, str]]]],
-]:
-    """Return grouped name/type fields and their NMI/channel bindings."""
-    schema: dict[Any, Any] = {}
-    bindings: dict[str, tuple[str, dict[str, tuple[str, str]]]] = {}
-
-    for meter_index, nmi in enumerate(nmis, start=1):
-        meter_channels = channel_config.get(nmi, {})
-        if not meter_channels:
-            continue
-        section_key = f"{_meter_label(nmi, nmi_names)} channels"
-        if section_key in bindings:
-            section_key = f"{section_key} #{meter_index}"
-        fields: dict[Any, Any] = {}
-        channel_bindings: dict[str, tuple[str, str]] = {}
-        for channel in sorted(meter_channels):
-            definition = meter_channels[channel]
-            name_key = f"{channel} name"
-            type_key = f"{channel} use as"
-            fields[
-                vol.Required(
-                    name_key,
-                    default=definition.get(CONF_CHANNEL_NAME, channel),
-                )
-            ] = selector.TextSelector()
-            fields[
-                vol.Required(
-                    type_key,
-                    default=definition.get(CONF_CHANNEL_TYPE, CHANNEL_TYPE_IGNORE),
-                )
-            ] = _channel_type_selector()
-            channel_bindings[channel] = (name_key, type_key)
-        schema[vol.Required(section_key)] = section(
-            vol.Schema(fields),
-            SectionConfig(collapsed=True),
-        )
-        bindings[section_key] = (nmi, channel_bindings)
-
-    if not schema:
-        schema[vol.Required("Continue without discovered channels", default=True)] = (
-            selector.BooleanSelector()
-        )
-    return vol.Schema(schema), bindings
-
-
-def _channel_form_result(
-    user_input: Mapping[str, Any],
-    bindings: Mapping[str, tuple[str, Mapping[str, tuple[str, str]]]],
-    defaults: Mapping[str, Mapping[str, Mapping[str, str]]],
-) -> dict[str, dict[str, dict[str, str]]]:
-    """Convert dynamic channel form sections into stored configuration."""
-    result = {
-        str(nmi): {
-            str(channel): {
-                CONF_CHANNEL_NAME: str(definition.get(CONF_CHANNEL_NAME, channel)),
-                CONF_CHANNEL_TYPE: str(
-                    definition.get(CONF_CHANNEL_TYPE, CHANNEL_TYPE_IGNORE)
-                ),
-            }
-            for channel, definition in channels.items()
-        }
-        for nmi, channels in defaults.items()
-    }
-    for section_key, (nmi, channel_bindings) in bindings.items():
-        section_data = user_input.get(section_key, {})
-        if not isinstance(section_data, Mapping):
-            continue
-        for channel, (name_key, type_key) in channel_bindings.items():
-            name = str(section_data.get(name_key, channel)).strip() or channel
-            channel_type = str(section_data.get(type_key, CHANNEL_TYPE_IGNORE)).strip()
-            result.setdefault(nmi, {})[channel] = {
-                CONF_CHANNEL_NAME: name,
-                CONF_CHANNEL_TYPE: channel_type,
-            }
-    return result
-
-
-def _discovery_warning(
-    errors: Mapping[str, str],
-    nmi_names: Mapping[str, str],
-) -> str:
-    """Return a concise warning for meters whose channels were unavailable."""
-    if not errors:
-        return "All selected meters were inspected successfully."
-    labels = ", ".join(_meter_label(nmi, nmi_names) for nmi in errors)
-    return (
-        "No recent channels could be read for: "
-        f"{labels}. They can be configured later when SAPN returns data."
-    )
-
-
-class SAPNMeterDataConfigFlow(ConfigFlow, domain=DOMAIN):
-    """Handle an SA Power Networks Meter Data config flow."""
-
-    VERSION = 4
-
-    def __init__(self) -> None:
-        """Initialize the flow."""
+    def _init_steps(self, defaults: Mapping[str, Any]) -> None:
         self._email = ""
         self._password = ""
-        self._client: Any | None = None
-        self._available_nmis: list[str] = []
-        self._excluded_nmis: dict[str, str] = {}
-        self._nmi_names: dict[str, str] = {}
-        self._selected_nmis: list[str] = []
-        self._channel_config: dict[str, dict[str, dict[str, str]]] = {}
-        self._channel_errors: dict[str, str] = {}
-        self._channel_bindings: dict[
-            str,
-            tuple[str, dict[str, tuple[str, str]]],
-        ] = {}
+        self._defaults = defaults
+        self._meters = {}
+        self._excluded = []
+        self._selected = []
+        self._discovered = {}
+        self._channels = {}
+        self._queue = []
 
-    @staticmethod
-    @callback
-    @override
-    def async_get_options_flow(config_entry: ConfigEntry) -> OptionsFlow:
-        """Return the options flow."""
-        return SAPNMeterDataOptionsFlow()
+    async def _async_load_meters(self, email: str, password: str) -> str | None:
+        """Sign in and list the account's meters; return an error key."""
+        try:
+            assignments = await _async_fetch_meters(self.hass, email, password)
+        except Exception as err:  # noqa: BLE001
+            return _error_key(err)
+        self._email, self._password = email, password
+        self._meters = {
+            meter.nmi: meter
+            for meter in assignments
+            if meter.supports_interval_data is not False
+        }
+        self._excluded = [
+            meter for meter in assignments if meter.supports_interval_data is False
+        ]
+        return None if self._meters else "no_interval_meters"
 
-    @override
-    async def async_step_user(
-        self,
-        user_input: dict[str, Any] | None = None,
-    ) -> ConfigFlowResult:
-        """Collect credentials and discover assigned NMIs."""
-        errors: dict[str, str] = {}
-        if user_input is not None:
-            self._email = user_input[CONF_EMAIL].strip()
-            self._password = user_input[CONF_PASSWORD]
-            try:
-                (
-                    self._client,
-                    self._available_nmis,
-                    self._nmi_names,
-                    self._excluded_nmis,
-                ) = await self.hass.async_add_executor_job(
-                    _connect_account,
-                    self._email,
-                    self._password,
-                )
-            except InvalidAuthError:
-                errors["base"] = "invalid_auth"
-            except CannotConnectError:
-                errors["base"] = "cannot_connect"
-            except Exception:
-                _LOGGER.exception("Unexpected error validating SAPN credentials")
-                errors["base"] = "unknown"
-            else:
-                if not self._available_nmis:
-                    errors["base"] = (
-                        "no_interval_nmis" if self._excluded_nmis else "no_nmis"
-                    )
-                elif any(
-                    str(entry.data.get(CONF_EMAIL, "")).casefold()
-                    == self._email.casefold()
-                    for entry in self._async_current_entries()
-                ):
-                    return self.async_abort(reason="already_configured")
-                else:
-                    await self.async_set_unique_id(self._email.casefold())
-                    self._abort_if_unique_id_configured()
-                    return await self.async_step_meters()
+    def _options(self) -> dict[str, Any]:
+        return {
+            CONF_NMIS: list(self._selected),
+            CONF_METER_NAMES: {nmi: self._meters[nmi].name for nmi in self._selected},
+            CONF_CHANNELS: {nmi: self._channels.get(nmi, {}) for nmi in self._selected},
+        }
 
-        return self.async_show_form(
-            step_id="user",
-            data_schema=_credentials_schema(),
-            errors=errors,
-        )
+    def _async_finish(self) -> ConfigFlowResult:
+        raise NotImplementedError
 
     async def async_step_meters(
         self,
         user_input: dict[str, Any] | None = None,
     ) -> ConfigFlowResult:
-        """Select meters and inspect their recent NEM12 channels."""
+        """Choose which meters to import."""
         errors: dict[str, str] = {}
         if user_input is not None:
-            if not user_input[CONF_NMIS]:
-                errors["base"] = "select_nmi"
+            selected = [nmi for nmi in user_input[CONF_NMIS] if nmi in self._meters]
+            if not selected:
+                errors["base"] = "no_meters_selected"
             else:
-                self._selected_nmis = [str(nmi) for nmi in user_input[CONF_NMIS]]
                 try:
-                    (
-                        discovered,
-                        self._channel_errors,
-                    ) = await self.hass.async_add_executor_job(
-                        _discover_channels,
-                        self._client,
-                        self._selected_nmis,
+                    self._discovered = await _async_discover_channels(
+                        self.hass, self._email, self._password, selected
                     )
-                except InvalidAuthError:
-                    errors["base"] = "invalid_auth"
-                except Exception:
-                    _LOGGER.exception("Unexpected error discovering SAPN channels")
-                    errors["base"] = "channel_discovery"
+                except Exception as err:  # noqa: BLE001
+                    errors["base"] = _error_key(err)
                 else:
-                    self._channel_config = merge_channel_config(
-                        self._selected_nmis,
-                        discovered,
-                    )
+                    self._selected = selected
+                    self._queue = list(selected)
                     return await self.async_step_channels()
 
-        return self.async_show_form(
-            step_id="meters",
-            data_schema=_meter_schema(
-                self._available_nmis,
-                self._nmi_names,
-                {CONF_NMIS: self._selected_nmis or self._available_nmis},
-            ),
-            errors=errors,
-            description_placeholders={
-                "excluded_meters": _excluded_meter_summary(
-                    self._excluded_nmis,
-                    self._nmi_names,
+        default = [
+            nmi for nmi in self._defaults.get(CONF_NMIS, []) if nmi in self._meters
+        ] or list(self._meters)
+        schema = vol.Schema(
+            {
+                vol.Required(CONF_NMIS, default=default): SelectSelector(
+                    SelectSelectorConfig(
+                        options=[
+                            SelectOptionDict(value=nmi, label=_meter_label(meter))
+                            for nmi, meter in self._meters.items()
+                        ],
+                        multiple=True,
+                        mode=SelectSelectorMode.LIST,
+                    )
                 )
-            },
+            }
+        )
+        excluded = ", ".join(
+            f"{_meter_label(meter)}: {meter.meter_type_label}"
+            for meter in self._excluded
+        )
+        return self.async_show_form(  # type: ignore[attr-defined,no-any-return]
+            step_id="meters",
+            data_schema=schema,
+            errors=errors,
+            description_placeholders={"excluded": excluded or "none"},
         )
 
     async def async_step_channels(
         self,
         user_input: dict[str, Any] | None = None,
     ) -> ConfigFlowResult:
-        """Name every discovered channel and choose how it is imported."""
-        data_schema, self._channel_bindings = _channel_schema(
-            self._selected_nmis,
-            self._nmi_names,
-            self._channel_config,
-        )
-        if user_input is not None:
-            channel_config = _channel_form_result(
-                user_input,
-                self._channel_bindings,
-                self._channel_config,
-            )
-            return self.async_create_entry(
-                title=self._email,
-                data={
-                    CONF_EMAIL: self._email,
-                    CONF_PASSWORD: self._password,
-                    CONF_AVAILABLE_NMIS: self._available_nmis,
-                    CONF_EXCLUDED_NMIS: self._excluded_nmis,
-                    CONF_NMIS: self._selected_nmis,
-                    CONF_NMI_NAMES: self._nmi_names,
-                    CONF_CHANNEL_CONFIG: channel_config,
-                    CONF_CONSUMPTION_CHANNELS: DEFAULT_CONSUMPTION_CHANNELS,
-                    CONF_RETURN_CHANNELS: DEFAULT_RETURN_CHANNELS,
-                },
-            )
+        """Name each channel of one meter and choose how it is used."""
+        nmi = self._queue[0]
+        configured = self._defaults.get(CONF_CHANNELS, {}).get(nmi, {})
+        channels = sorted(set(self._discovered.get(nmi, [])) | set(configured))
 
-        return self.async_show_form(
+        if channels and user_input is not None:
+            self._channels[nmi] = {
+                channel: {
+                    CONF_CHANNEL_NAME: (
+                        str(user_input[f"{channel} name"]).strip() or channel
+                    ),
+                    CONF_CHANNEL_TYPE: user_input[f"{channel} use"],
+                }
+                for channel in channels
+            }
+        if not channels or user_input is not None:
+            # A meter with no recent data gets default channels once SAPN
+            # returns some.
+            self._channels.setdefault(nmi, {})
+            self._queue.pop(0)
+            if self._queue:
+                return await self.async_step_channels()
+            return self._async_finish()
+
+        fields: dict[Any, Any] = {}
+        for channel in channels:
+            name, channel_type = channel_settings(self._defaults, nmi, channel)
+            fields[vol.Required(f"{channel} name", default=name)] = TextSelector()
+            fields[vol.Required(f"{channel} use", default=channel_type)] = (
+                CHANNEL_TYPE_SELECTOR
+            )
+        return self.async_show_form(  # type: ignore[attr-defined,no-any-return]
             step_id="channels",
-            data_schema=data_schema,
-            description_placeholders={
-                "discovery_result": _discovery_warning(
-                    self._channel_errors,
-                    self._nmi_names,
-                )
-            },
+            data_schema=vol.Schema(fields),
+            description_placeholders={"meter": _meter_label(self._meters[nmi])},
+        )
+
+
+class SAPNConfigFlow(_MeterSteps, ConfigFlow, domain=DOMAIN):
+    """Set up SA Power Networks Meter Data."""
+
+    VERSION = 5
+
+    def __init__(self) -> None:
+        """Initialize the flow."""
+        self._init_steps({})
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(config_entry: SAPNConfigEntry) -> SAPNOptionsFlow:
+        """Return the options flow."""
+        return SAPNOptionsFlow()
+
+    async def async_step_user(
+        self,
+        user_input: dict[str, Any] | None = None,
+    ) -> ConfigFlowResult:
+        """Ask for the portal login."""
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            email = user_input[CONF_EMAIL].strip()
+            await self.async_set_unique_id(email.casefold())
+            self._abort_if_unique_id_configured()
+            if error := await self._async_load_meters(email, user_input[CONF_PASSWORD]):
+                errors["base"] = error
+            else:
+                return await self.async_step_meters()
+        return self.async_show_form(
+            step_id="user",
+            data_schema=self.add_suggested_values_to_schema(
+                USER_SCHEMA,
+                {CONF_EMAIL: user_input[CONF_EMAIL]} if user_input else {},
+            ),
+            errors=errors,
+        )
+
+    def _async_finish(self) -> ConfigFlowResult:
+        return self.async_create_entry(
+            title=self._email,
+            data={CONF_EMAIL: self._email, CONF_PASSWORD: self._password},
+            options=self._options(),
         )
 
     async def async_step_reauth(
         self,
         entry_data: Mapping[str, Any],
     ) -> ConfigFlowResult:
-        """Start reauthentication."""
+        """Start reauthentication after SAPN rejects the login."""
         return await self.async_step_reauth_confirm()
 
     async def async_step_reauth_confirm(
         self,
         user_input: dict[str, Any] | None = None,
     ) -> ConfigFlowResult:
-        """Update credentials after an authentication failure."""
-        errors: dict[str, str] = {}
+        """Ask for the new password."""
         entry = self._get_reauth_entry()
         email = entry.data[CONF_EMAIL]
+        errors: dict[str, str] = {}
         if user_input is not None:
-            try:
-                (
-                    _,
-                    nmis,
-                    nmi_names,
-                    excluded_nmis,
-                ) = await self.hass.async_add_executor_job(
-                    _connect_account,
-                    email,
-                    user_input[CONF_PASSWORD],
-                )
-            except InvalidAuthError:
-                errors["base"] = "invalid_auth"
-            except CannotConnectError:
-                errors["base"] = "cannot_connect"
-            except Exception:
-                _LOGGER.exception("Unexpected error reauthenticating with SAPN")
-                errors["base"] = "unknown"
+            if error := await self._async_load_meters(email, user_input[CONF_PASSWORD]):
+                errors["base"] = error
             else:
                 return self.async_update_reload_and_abort(
-                    entry,
-                    data_updates={
-                        CONF_PASSWORD: user_input[CONF_PASSWORD],
-                        CONF_AVAILABLE_NMIS: nmis,
-                        CONF_EXCLUDED_NMIS: excluded_nmis,
-                        CONF_NMI_NAMES: nmi_names,
-                    },
+                    entry, data_updates={CONF_PASSWORD: user_input[CONF_PASSWORD]}
                 )
-
         return self.async_show_form(
             step_id="reauth_confirm",
-            description_placeholders={CONF_EMAIL: email},
-            data_schema=vol.Schema(
-                {
-                    vol.Required(CONF_PASSWORD): selector.TextSelector(
-                        selector.TextSelectorConfig(
-                            type=selector.TextSelectorType.PASSWORD,
-                            autocomplete="current-password",
-                        )
-                    )
-                }
-            ),
+            data_schema=REAUTH_SCHEMA,
             errors=errors,
+            description_placeholders={"email": email},
         )
 
 
-class SAPNMeterDataOptionsFlow(OptionsFlow):
-    """Handle SA Power Networks Meter Data options."""
+class SAPNOptionsFlow(_MeterSteps, OptionsFlow):
+    """Change the imported meters and channels."""
 
-    def __init__(self) -> None:
-        """Initialize the options flow."""
-        self._client: Any | None = None
-        self._available_nmis: list[str] | None = None
-        self._excluded_nmis: dict[str, str] | None = None
-        self._nmi_names: dict[str, str] | None = None
-        self._selected_nmis: list[str] = []
-        self._channel_config: dict[str, dict[str, dict[str, str]]] = {}
-        self._channel_errors: dict[str, str] = {}
-        self._channel_bindings: dict[
-            str,
-            tuple[str, dict[str, tuple[str, str]]],
-        ] = {}
+    config_entry: SAPNConfigEntry
 
-    @override
     async def async_step_init(
         self,
         user_input: dict[str, Any] | None = None,
     ) -> ConfigFlowResult:
-        """Select meters before editing their individual channels."""
-        current = {**self.config_entry.data, **self.config_entry.options}
-        errors: dict[str, str] = {}
+        """Refresh the account's meters, then show the meter selection."""
+        self._init_steps(self.config_entry.options)
+        if error := await self._async_load_meters(
+            self.config_entry.data[CONF_EMAIL],
+            self.config_entry.data[CONF_PASSWORD],
+        ):
+            return self.async_abort(reason=error)
+        return await self.async_step_meters()
 
-        if self._available_nmis is None:
-            try:
-                (
-                    self._client,
-                    self._available_nmis,
-                    self._nmi_names,
-                    self._excluded_nmis,
-                ) = await self.hass.async_add_executor_job(
-                    _connect_account,
-                    self.config_entry.data[CONF_EMAIL],
-                    self.config_entry.data[CONF_PASSWORD],
-                )
-            except InvalidAuthError:
-                errors["base"] = "invalid_auth"
-            except CannotConnectError:
-                errors["base"] = "cannot_connect"
-            except Exception:
-                _LOGGER.exception("Unexpected error refreshing SAPN NMIs")
-                errors["base"] = "unknown"
-
-        available_nmis = (
-            self._available_nmis
-            if self._available_nmis is not None
-            else [
-                str(nmi)
-                for nmi in self.config_entry.data.get(
-                    CONF_AVAILABLE_NMIS,
-                    self.config_entry.data[CONF_NMIS],
-                )
-            ]
-        )
-        nmi_names = (
-            self._nmi_names
-            if self._nmi_names is not None
-            else {
-                str(nmi): str(name)
-                for nmi, name in current.get(CONF_NMI_NAMES, {}).items()
-            }
-        )
-        for nmi in available_nmis:
-            nmi_names.setdefault(nmi, nmi)
-        self._nmi_names = nmi_names
-        excluded_nmis = (
-            self._excluded_nmis
-            if self._excluded_nmis is not None
-            else {
-                str(nmi): str(meter_type)
-                for nmi, meter_type in current.get(CONF_EXCLUDED_NMIS, {}).items()
-            }
-        )
-        self._excluded_nmis = excluded_nmis
-
-        if user_input is not None:
-            if not user_input[CONF_NMIS]:
-                errors["base"] = "select_nmi"
-            else:
-                self._selected_nmis = [str(nmi) for nmi in user_input[CONF_NMIS]]
-                discovered: dict[str, tuple[str, ...]] = {}
-                if self._client is not None:
-                    try:
-                        (
-                            discovered,
-                            self._channel_errors,
-                        ) = await self.hass.async_add_executor_job(
-                            _discover_channels,
-                            self._client,
-                            self._selected_nmis,
-                        )
-                    except InvalidAuthError:
-                        errors["base"] = "invalid_auth"
-                    except Exception:
-                        _LOGGER.exception("Unexpected error discovering SAPN channels")
-                        errors["base"] = "channel_discovery"
-                if not errors:
-                    self._channel_config = merge_channel_config(
-                        self._selected_nmis,
-                        discovered,
-                        current.get(CONF_CHANNEL_CONFIG, {}),
-                        consumption_patterns=current.get(
-                            CONF_CONSUMPTION_CHANNELS,
-                            DEFAULT_CONSUMPTION_CHANNELS,
-                        ),
-                        return_patterns=current.get(
-                            CONF_RETURN_CHANNELS,
-                            DEFAULT_RETURN_CHANNELS,
-                        ),
-                    )
-                    return await self.async_step_channels()
-
-        return self.async_show_form(
-            step_id="init",
-            data_schema=_meter_schema(
-                available_nmis,
-                nmi_names,
-                current,
-            ),
-            errors=errors,
-            description_placeholders={
-                "excluded_meters": _excluded_meter_summary(
-                    excluded_nmis,
-                    nmi_names,
-                )
-            },
-        )
-
-    async def async_step_channels(
-        self,
-        user_input: dict[str, Any] | None = None,
-    ) -> ConfigFlowResult:
-        """Rename and classify the selected meters' channels."""
-        current = {**self.config_entry.data, **self.config_entry.options}
-        nmi_names = self._nmi_names or {}
-        data_schema, self._channel_bindings = _channel_schema(
-            self._selected_nmis,
-            nmi_names,
-            self._channel_config,
-        )
-        if user_input is not None:
-            channel_config = _channel_form_result(
-                user_input,
-                self._channel_bindings,
-                self._channel_config,
-            )
-            return self.async_create_entry(
-                title="",
-                data={
-                    CONF_NMIS: self._selected_nmis,
-                    CONF_NMI_NAMES: nmi_names,
-                    CONF_EXCLUDED_NMIS: self._excluded_nmis or {},
-                    CONF_CHANNEL_CONFIG: channel_config,
-                    CONF_CONSUMPTION_CHANNELS: current.get(
-                        CONF_CONSUMPTION_CHANNELS,
-                        DEFAULT_CONSUMPTION_CHANNELS,
-                    ),
-                    CONF_RETURN_CHANNELS: current.get(
-                        CONF_RETURN_CHANNELS,
-                        DEFAULT_RETURN_CHANNELS,
-                    ),
-                },
-            )
-
-        return self.async_show_form(
-            step_id="channels",
-            data_schema=data_schema,
-            description_placeholders={
-                "discovery_result": _discovery_warning(
-                    self._channel_errors,
-                    nmi_names,
-                )
-            },
-        )
+    def _async_finish(self) -> ConfigFlowResult:
+        return self.async_create_entry(data=self._options())

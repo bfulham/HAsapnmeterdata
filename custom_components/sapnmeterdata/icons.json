@@ -1,0 +1,22 @@
+{
+  "entity": {
+    "sensor": {
+      "sync_status": {
+        "default": "mdi:cloud-sync",
+        "state": {
+          "up_to_date": "mdi:cloud-check",
+          "waiting_for_data": "mdi:cloud-clock",
+          "error": "mdi:cloud-alert"
+        }
+      },
+      "latest_data": {
+        "default": "mdi:calendar-check"
+      }
+    },
+    "button": {
+      "sync_now": {
+        "default": "mdi:cloud-refresh"
+      }
+    }
+  }
+}

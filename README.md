@@ -1,216 +1,119 @@
 # SA Power Networks Meter Data for Home Assistant
 
-A Home Assistant custom integration that imports completed daily meter data
-from SA Power Networks' customer portal into Home Assistant's long-term
-statistics. The resulting grid-consumption and return-to-grid statistics can be
-selected directly in the Energy Dashboard.
+Imports your interval meter data from SA Power Networks' **Your Meter Data**
+portal into Home Assistant's long-term statistics, ready for the Energy
+dashboard. Each meter channel (general consumption, controlled load, solar
+export, …) becomes its own statistic, with its complete history.
 
-This integration uses
-[`sapnmeterdata`](https://pypi.org/project/sapnmeterdata/) 0.3.3.
+SAPN's data is historical: each day is published the following morning. This
+integration is not a real-time power feed.
 
-Version 0.3.0 introduced separate statistics for every selected NEM12 channel.
-Version 0.3.1 fixes historical imports that cross the Adelaide daylight-saving
-fallback hour. Version 0.3.2 automatically excludes basic and manually read
-meters that cannot provide interval history. Version 0.3.3 fixes status updates
-for accounts containing excluded meters and removes account-specific examples
-from the public project. Channels are discovered from a bounded recent sample
-and can be named and classified separately for every interval-capable meter.
+> Not affiliated with SA Power Networks. The portal has no public API, so
+> changes SAPN makes to it can temporarily break the integration.
 
-## Upgrading to 0.3.0
+## Upgrading from 0.x
 
-Versions through 0.2.5 combined all matching E channels into one consumption
-statistic and all matching B channels into one return-to-grid statistic.
-Version 0.3.0 replaces those aggregate streams with stable NMI/channel pairs:
+Version 1.0 is a rewrite and does not upgrade old entries:
 
-- `sapnmeterdata:nmi_e1`
-- `sapnmeterdata:nmi_e2`
-- `sapnmeterdata:nmi_b1`
+1. Update the integration and restart Home Assistant. The old entry shows a
+   migration error.
+2. Delete the old entry, then add the integration again.
+3. On first sync, each channel's existing statistics are **replaced** by a
+   fresh import of the complete history SAPN provides. Statistic IDs are
+   unchanged (`sapnmeterdata:<nmi>_<channel>`), so Energy dashboard
+   selections keep working. Anything older than SAPN's history is removed.
 
-The one-time migration removes the old aggregate SAPN statistics and imports
-the latest available day using the new channel IDs. Existing Energy Dashboard
-selections that point to `<nmi>_consumption` or `<nmi>_return` must be replaced
-with the appropriate channel statistics. Press **Update historical data**
-afterward to populate older history for every enabled channel.
-
-Existing entries retain their credentials, selected NMIs, friendly meter
-names, and the previous E/B classification defaults. Open **Configure** after
-upgrading to inspect the channels SAPN currently returns and give each one a
-useful name.
-
-## What it does
-
-- Discovers assigned NMIs and their SAPN meter descriptions.
-- Excludes assignments identified by SAPN as basic or manually read meters.
-- Discovers the actual NEM12 channels returned for each selected meter.
-- Imports every enabled channel separately.
-- Lets each NMI/channel pair have its own name and classification.
-- Defaults `E*` to grid consumption and `B*` to return to grid.
-- Detects other registers such as `K1` and `Q1` but ignores them by default.
-- Aggregates five-minute readings into Home Assistant's required hourly
-  external statistics, including 23- and 25-hour daylight-saving days.
-- Aligns every imported row to Home Assistant's UTC hour boundaries so grid,
-  solar, and return-to-grid values share the same Energy Dashboard bars.
-- Maintains continuous cumulative kWh totals for Energy Dashboard reporting.
-- Rejects partially published days and retries delayed NMIs without creating
-  duplicate rows.
-- Catches up one day at a time after Home Assistant has been offline, with
-  one-minute follow-up runs while completed dates remain queued.
-- Backfills older portal history in bounded, resumable seven-day chunks.
-
-SAPN's portal is not a documented public API, so portal changes can temporarily
-break data retrieval.
-
-## SAPN publication time
-
-SAPN publishes the previous day's data at **3:00 am Adelaide time**. For
-example, data for 26 July becomes eligible at 3:00 am on 27 July.
-
-The integration:
-
-1. Never requests the previous day before 3:00 am.
-2. Runs a dedicated daily import at 3:05 am Adelaide time.
-3. Checks again every three hours if SAPN reports that the data is not ready.
-
-This avoids expected failures between midnight and SAPN's 3:00 am publication.
+Why the full re-import: versions before 1.0 read SAPN's timestamps as
+Adelaide local time. NEM12 meter data is in NEM time (UTC+10 all year, no
+daylight saving), so older imports placed every reading 30 minutes out and
+mangled the hours around each daylight-saving change.
 
 ## Installation
 
-### HACS custom repository
+**HACS:** add `https://github.com/bfulham/HAsapnmeterdata` as a custom
+repository of type *Integration*, install **SA Power Networks Meter Data**,
+and restart Home Assistant.
 
-1. In HACS, open **Custom repositories**.
-2. Add `https://github.com/bfulham/HAsapnmeterdata`.
-3. Choose **Integration**.
-4. Install **SA Power Networks Meter Data**.
-5. Restart Home Assistant.
+**Manual:** copy `custom_components/sapnmeterdata` into your configuration's
+`custom_components` directory and restart Home Assistant.
 
-### Manual
+## Setup
 
-Copy `custom_components/sapnmeterdata` into the `custom_components` directory
-under your Home Assistant configuration directory, then restart Home Assistant.
+1. Register for SAPN's free
+   [Your Meter Data](https://www.sapowernetworks.com.au/your-power/manage-your-power-use/your-meter-data/)
+   service if you have not already.
+2. In **Settings → Devices & services**, add **SA Power Networks Meter
+   Data** and sign in with your portal email and password.
+3. Choose the meters to import. Basic and manually read meters have no
+   interval data and are left out.
+4. For each meter, name its channels and choose how each is used. Defaults:
+   `E*` channels are grid consumption, `B*` channels are return to grid, and
+   anything else (such as reactive energy) is ignored.
 
-## Configuration
+The complete history then imports in the background. This takes a few
+minutes per meter; the **Sync status** sensor shows *Syncing* meanwhile.
 
-1. Go to **Settings → Devices & services**.
-2. Select **Add integration** and search for
-   **SA Power Networks Meter Data**.
-3. Enter the email and password used for the SAPN meter-data portal.
-4. Select one or more interval-capable meters. The list shows SAPN's friendly
-   description and NMI so similarly named meters can still be distinguished.
-   Basic or manually read meters are listed as automatically excluded because
-   they cannot provide the interval history required by the Energy Dashboard.
-5. Wait while the integration inspects a recent 14-day sample for each selected
-   meter.
-6. For every discovered channel:
-   - enter the name that should appear in Home Assistant;
-   - choose **Grid consumption**, **Return to grid**, or **Ignore**.
+### Energy dashboard
 
-For example:
+In **Settings → Dashboards → Energy**, add each consumption channel under
+*Grid consumption* and each export channel under *Return to grid*. They are
+listed by name, for example *SAPN Home General* and *SAPN Home Solar*.
 
-| Meter | Channel | Name | Use as |
-|---|---|---|---|
-| NMI 1 | `E1` | Standard Consumption | Grid consumption |
-| NMI 1 | `E2` | Controlled Load | Grid consumption |
-| NMI 1 | `B1` | Solar | Return to grid |
-| NMI 2 | `E1` | Pump Station | Grid consumption |
+## How syncing works
 
-## Add it to the Energy Dashboard
+- SAPN publishes each day at 3:00 am Adelaide time. The integration syncs
+  daily at 3:20 am.
+- If a published day is still missing, it checks again hourly until noon,
+  then every three hours.
+- Each sync signs in once and requests only the days it still needs.
+- A missing day never holds up later days. It is re-requested on each sync
+  for up to 60 days.
+- Estimated or substituted readings are imported straight away and
+  re-requested until SAPN publishes final readings. Corrections flow through.
+- Portal outages and maintenance are retried after 15 minutes, backing off to
+  every three hours. You are only asked to re-enter your password when SAPN
+  actually rejects it (or sign-in fails three syncs in a row).
+- A channel that first appears after setup (for example after installing
+  solar) is imported automatically using the defaults above.
 
-After the first successful import:
+Use **Configure** on the integration to change meters, channel names, or
+channel use. Newly enabled channels get their full history.
 
-1. Go to **Settings → Dashboards → Energy**.
-2. Under **Electricity grid**, choose **Add consumption**.
-3. Add each consumption channel you want included, such as
-   `SAPN Example Meter Standard Consumption` and
-   `SAPN Example Meter Controlled Load`.
-4. Under **Return to grid**, select the named export channel, such as
-   `SAPN Example Meter Solar`.
-5. Add a tariff entity only if you want Home Assistant to calculate cost.
+## Entities
 
-External statistic IDs use
-`sapnmeterdata:<nmi>_<channel>`. Renaming a channel changes only its displayed
-name; its statistic ID and accumulated history remain attached to the NMI and
-SAPN channel code.
-
-## Import behavior
-
-The integration stores a checkpoint per NMI. Repeating an import is safe:
-Home Assistant updates rows with the same statistic ID and hour instead of
-adding duplicates.
-
-If Home Assistant missed several days, the integration catches up one day per
-bounded request and schedules one-minute follow-up runs while completed dates
-remain queued. A missing or partially published day remains at that NMI's
-checkpoint and is retried; it is never marked processed merely because newer
-days are available. Other NMIs keep their own checkpoints and continue
-independently.
-
-On the first refresh after upgrading, existing checkpoints are rewound by seven days so
-recent dates that older versions may have skipped are safely reconciled. The
-statistics import is idempotent, so readings already present are updated rather
-than duplicated.
-
-Assignments described by SAPN as **Basic Meter** or **Manual Meter** are
-excluded before data retrieval. Existing entries learn this classification
-during their next refresh, so a non-interval meter cannot remain permanently
-in the forward queue or prevent historical backfilling.
-
-The **Import previous day** button requests an immediate check. Before 3:00 am
-it still respects SAPN's availability cutoff and will not request yesterday
-early.
-
-### Historical import
-
-Press **Update historical data** once to import everything the SAPN portal
-makes available before the integration's earliest recorded day.
-
-- Each NMI is requested in seven-day chunks rather than one multi-year
-  download.
-- Successful chunks are separated by one minute to limit portal load.
-- Daily forward imports remain the priority.
-- Progress is saved after every chunk and resumes after a Home Assistant
-  restart.
-- Importing stops separately for each NMI when SAPN reports that no older data
-  is available.
-- A failed NMI is paused rather than retried continuously. Press the button
-  again to clear failed markers and retry from its saved checkpoint.
-
-The **Import status** sensor shows `Updating historical data` while work
-remains. Its `historical_backfill` attribute contains each NMI's checkpoint,
-the completed and failed NMIs, and the number of imported chunks. Its
-`meter_names` attribute maps each stable NMI to the friendly name returned by
-SAPN.
-
-## Channel configuration
-
-Each meter has its own channel map, so `E1` can be named **Standard
-Consumption** on one NMI and **Pump Station** on another.
-
-| Channel default | Initial classification |
+| Entity | Description |
 |---|---|
-| `E*` | Grid consumption |
-| `B*` | Return to grid |
-| Other channels | Ignore |
+| Sync status | `Up to date`, `Waiting for SAPN`, `Syncing`, or `Error`. Attributes: last successful sync, next sync, error. |
+| Latest data (per meter) | The newest day imported for all of the meter's channels. Attributes: days awaiting data, error. |
+| Sync now | Checks SAPN immediately. |
 
-Change selected meters, channel names, or classifications from the
-integration's **Configure** dialog. If you enable a previously ignored channel,
-the integration reimports the latest available day. Press **Update historical
-data** to fill its older history in bounded seven-day chunks.
+Meter readings live in long-term statistics, not in these entities. View them
+in **Developer tools → Statistics** or in the Energy dashboard.
 
-## Data retention and removal
+## Removing the integration
 
-The imported readings are long-term Recorder statistics rather than ordinary
-sensor history. Removing the integration does not automatically delete those
-statistics. They can be inspected or removed from **Developer tools →
-Statistics**.
+Deleting the integration keeps the imported statistics. Remove them in
+**Developer tools → Statistics** if you no longer want them.
+
+## Troubleshooting
+
+- Download diagnostics from the integration's menu. Credentials, meter names,
+  and NMIs are removed.
+- `tools/sapn_probe.py` checks the portal behaviour the integration relies on,
+  using your login from your own terminal:
+
+  ```bash
+  python -m pip install aiohttp
+  python tools/sapn_probe.py
+  ```
 
 ## Development
 
 ```bash
-python -m pip install "pandas==2.3.3" pytest ruff sapnmeterdata==0.3.3
-ruff check .
-python -m compileall -q custom_components
+python -m pip install -r requirements_test.txt
+ruff check . && ruff format --check .
 pytest
 ```
 
-GitHub Actions runs the tests, Ruff, HACS validation, and Home Assistant's
-`hassfest` validation.
+The portal client and NEM12 parser in `custom_components/sapnmeterdata/portal`
+do not depend on Home Assistant.

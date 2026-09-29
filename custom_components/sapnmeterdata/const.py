@@ -1,59 +1,45 @@
 """Constants for the SA Power Networks Meter Data integration."""
 
 import logging
-from datetime import time, timedelta
 
 DOMAIN = "sapnmeterdata"
 LOGGER = logging.getLogger(__package__)
 MANUFACTURER = "SA Power Networks"
 
-CONF_AVAILABLE_NMIS = "available_nmis"
-CONF_EXCLUDED_NMIS = "excluded_nmis"
+# Config entry options
 CONF_NMIS = "nmis"
-CONF_NMI_NAMES = "nmi_names"
-CONF_CHANNEL_CONFIG = "channel_config"
+CONF_METER_NAMES = "meter_names"
+CONF_CHANNELS = "channels"
 CONF_CHANNEL_NAME = "name"
 CONF_CHANNEL_TYPE = "type"
-CONF_CONSUMPTION_CHANNELS = "consumption_channels"
-CONF_RETURN_CHANNELS = "return_channels"
 
-CHANNEL_TYPE_CONSUMPTION = "consumption"
-CHANNEL_TYPE_RETURN = "return"
-CHANNEL_TYPE_IGNORE = "ignore"
-CHANNEL_TYPES = (
-    CHANNEL_TYPE_CONSUMPTION,
-    CHANNEL_TYPE_RETURN,
-    CHANNEL_TYPE_IGNORE,
-)
+CHANNEL_CONSUMPTION = "consumption"
+CHANNEL_RETURN = "return"
+CHANNEL_IGNORE = "ignore"
+CHANNEL_TYPES = (CHANNEL_CONSUMPTION, CHANNEL_RETURN, CHANNEL_IGNORE)
 
-DEFAULT_CONSUMPTION_CHANNELS = "E*"
-DEFAULT_RETURN_CHANNELS = "B*"
-CHANNEL_DISCOVERY_DAYS = 14
-SAPN_TIME_ZONE = "Australia/Adelaide"
+# Days of recent data inspected to find a meter's channels.
+DISCOVERY_DAYS = 14
+# Days requested at once. A range the portal refuses is split in half,
+# down to single days, before giving up.
+HISTORY_CHUNK_DAYS = 30
+# Upper bound on how far back history is requested.
+HISTORY_MAX_DAYS = 3 * 366
+# A run of this many days without data marks the start of a meter's history.
+HISTORY_EMPTY_DAYS = 60
+# Missing or not-yet-final days are re-requested for this many days.
+PENDING_RETENTION_DAYS = 60
+# Pause between portal requests to keep the load on SAPN light.
+REQUEST_DELAY_SECONDS = 2.0
+# Pause before retrying a request that failed to reach the portal.
+CONNECTION_RETRY_SECONDS = 10.0
+# Login failures without a rejection message before asking to reauthenticate.
+LOGIN_FAILURES_BEFORE_REAUTH = 3
 
-# SAPN publishes the completed previous day at 03:00 Adelaide time. Schedule
-# five minutes later to avoid racing the portal's refresh.
-DATA_AVAILABLE_TIME = time(hour=3)
-DAILY_REFRESH_TIME = time(hour=3, minute=5)
-UPDATE_INTERVAL = timedelta(hours=3)
-HISTORICAL_CHUNK_DAYS = 7
-HISTORICAL_CHUNK_DELAY = timedelta(minutes=1)
-FORWARD_RECOVERY_DAYS = 7
-FORWARD_RETRY_VERSION = 1
-STATISTICS_ALIGNMENT_VERSION = 3
 STORE_VERSION = 1
 
 STATUS_UP_TO_DATE = "up_to_date"
-STATUS_IMPORTED = "imported"
-STATUS_PARTIAL = "partial"
 STATUS_WAITING = "waiting_for_data"
-STATUS_ATTENTION = "attention"
-STATUS_BACKFILLING = "backfilling_history"
-STATUS_OPTIONS = [
-    STATUS_UP_TO_DATE,
-    STATUS_IMPORTED,
-    STATUS_PARTIAL,
-    STATUS_WAITING,
-    STATUS_ATTENTION,
-    STATUS_BACKFILLING,
-]
+STATUS_SYNCING = "syncing"
+STATUS_ERROR = "error"
+STATUS_OPTIONS = [STATUS_UP_TO_DATE, STATUS_WAITING, STATUS_SYNCING, STATUS_ERROR]

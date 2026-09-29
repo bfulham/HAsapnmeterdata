@@ -1,10 +1,9 @@
 {
-  "title": "SA Power Networks Meter Data",
   "config": {
     "step": {
       "user": {
         "title": "Connect to SA Power Networks",
-        "description": "Sign in to the SAPN meter-data portal. Credentials are stored by Home Assistant and sent only to SAPN.",
+        "description": "Sign in with the email address and password you use for SAPN's Your Meter Data portal.",
         "data": {
           "email": "Email",
           "password": "Password"
@@ -12,79 +11,102 @@
       },
       "meters": {
         "title": "Choose meters",
-        "description": "Select the interval-capable SAPN meters to import. Basic and manually read meters cannot provide interval history and are excluded. Home Assistant will inspect a recent 14-day sample to find each selected meter's NEM12 channels. {excluded_meters}",
+        "description": "Select the meters to import. Their complete history is imported in the background after setup.\n\nBasic and manually read meters have no interval data and are not listed. Excluded: {excluded}.",
         "data": {
           "nmis": "Meters"
         }
       },
       "channels": {
-        "title": "Name meter channels",
-        "description": "Every discovered channel is kept separate. Give each channel a useful name and choose whether it represents grid consumption, return to grid, or should be ignored. {discovery_result}"
+        "title": "Channels for {meter}",
+        "description": "Name each channel found in this meter's recent data and choose how it is used. Typically E1 is general consumption, E2 is controlled load, and B1 is solar export. Each channel becomes its own statistic for the Energy dashboard."
       },
       "reauth_confirm": {
         "title": "Reconnect to SA Power Networks",
-        "description": "Enter the current password for {email}.",
+        "description": "SAPN rejected the saved login. Enter the current password for {email}.",
         "data": {
           "password": "Password"
         }
       }
     },
     "error": {
-      "cannot_connect": "Could not connect to the SAPN portal.",
-      "invalid_auth": "The SAPN credentials were rejected.",
-      "no_nmis": "No NMIs were assigned to this SAPN account.",
-      "no_interval_nmis": "This SAPN account has no interval-capable meters. Basic and manually read meters cannot provide Energy Dashboard history.",
-      "select_nmi": "Select at least one NMI.",
-      "channel_discovery": "The selected meters' channels could not be inspected. Try again.",
-      "unknown": "Unexpected error."
+      "invalid_auth": "SAPN rejected the email address or password.",
+      "cannot_connect": "Could not reach the SAPN portal. Try again later.",
+      "portal_error": "The SAPN portal did not respond as expected. It may be down for maintenance; try again later.",
+      "no_interval_meters": "This account has no meters with interval data.",
+      "no_meters_selected": "Select at least one meter.",
+      "unknown": "Unexpected error. Check the Home Assistant log."
     },
     "abort": {
       "already_configured": "This SAPN account is already configured.",
-      "reauth_successful": "SAPN authentication was updated."
+      "reauth_successful": "The SAPN login has been updated."
     }
   },
   "options": {
     "step": {
-      "init": {
-        "title": "SA Power Networks Meter Data options",
-        "description": "Choose which interval-capable SAPN meters are imported. Basic and manually read meters are excluded automatically. Their recent NEM12 channels will be inspected on the next step. {excluded_meters}",
+      "meters": {
+        "title": "Choose meters",
+        "description": "Select the meters to import. Newly selected meters and channels have their complete history imported in the background.\n\nBasic and manually read meters have no interval data and are not listed. Excluded: {excluded}.",
         "data": {
           "nmis": "Meters"
         }
       },
       "channels": {
-        "title": "Name meter channels",
-        "description": "Rename or reclassify each channel. Existing statistic IDs remain based on the NMI and channel code. {discovery_result}"
+        "title": "Channels for {meter}",
+        "description": "Name each channel and choose how it is used. Renaming a channel keeps its statistic and history."
       }
     },
     "error": {
-      "cannot_connect": "Could not refresh the NMIs from the SAPN portal. Saved NMIs are still available.",
-      "invalid_auth": "The SAPN credentials were rejected.",
-      "select_nmi": "Select at least one NMI.",
-      "channel_discovery": "The selected meters' channels could not be inspected. Try again.",
-      "unknown": "Unexpected error while refreshing NMIs."
+      "no_meters_selected": "Select at least one meter.",
+      "invalid_auth": "SAPN rejected the email address or password.",
+      "cannot_connect": "Could not reach the SAPN portal. Try again later.",
+      "portal_error": "The SAPN portal did not respond as expected. It may be down for maintenance; try again later.",
+      "unknown": "Unexpected error. Check the Home Assistant log."
+    },
+    "abort": {
+      "invalid_auth": "SAPN rejected the saved login. Home Assistant will ask for the new password.",
+      "cannot_connect": "Could not reach the SAPN portal. Try again later.",
+      "portal_error": "The SAPN portal did not respond as expected. It may be down for maintenance; try again later.",
+      "no_interval_meters": "This account has no meters with interval data.",
+      "unknown": "Unexpected error. Check the Home Assistant log."
+    }
+  },
+  "selector": {
+    "channel_type": {
+      "options": {
+        "consumption": "Grid consumption",
+        "return": "Return to grid",
+        "ignore": "Ignore"
+      }
     }
   },
   "entity": {
     "sensor": {
-      "import_status": {
-        "name": "Import status",
+      "sync_status": {
+        "name": "Sync status",
         "state": {
           "up_to_date": "Up to date",
-          "imported": "Imported",
-          "partial": "Partially imported",
-          "waiting_for_data": "Waiting for SAPN data",
-          "attention": "Attention needed",
-          "backfilling_history": "Updating historical data"
+          "waiting_for_data": "Waiting for SAPN",
+          "syncing": "Syncing",
+          "error": "Error"
+        },
+        "state_attributes": {
+          "last_success": { "name": "Last successful sync" },
+          "next_sync": { "name": "Next sync" },
+          "error": { "name": "Error" }
+        }
+      },
+      "latest_data": {
+        "name": "Latest data",
+        "state_attributes": {
+          "pending_days": { "name": "Days awaiting data" },
+          "waiting_for_sapn": { "name": "Waiting for SAPN" },
+          "error": { "name": "Error" }
         }
       }
     },
     "button": {
-      "import_previous_day": {
-        "name": "Import previous day"
-      },
-      "update_historical_data": {
-        "name": "Update historical data"
+      "sync_now": {
+        "name": "Sync now"
       }
     }
   }

@@ -1,1196 +1,631 @@
-"""Data coordinator for SA Power Networks Meter Data."""
+"""Keep SA Power Networks meter data in Home Assistant statistics.
+
+Each sync signs in once and, for every selected meter:
+
+- imports the complete history of any enabled channel this config entry has
+  not imported before (replacing whatever that statistic held); otherwise
+- requests every day from the oldest day still needed to the newest day SAPN
+  should have published, and merges it into the statistics.
+
+A day that is missing, or whose readings are not yet final, is recorded as
+pending and re-requested on later syncs for up to ``PENDING_RETENTION_DAYS``.
+Missing days never stop newer days from being imported.
+"""
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
-from datetime import UTC, date, datetime, time, timedelta
-from typing import Any, Literal, override
+import asyncio
+import time
+from collections.abc import Iterable, Iterator, Mapping
+from contextlib import contextmanager
+from dataclasses import dataclass, field, replace
+from datetime import date, datetime, timedelta
+from typing import Any
 
+import aiohttp
 from homeassistant.components.recorder import get_instance
-from homeassistant.components.recorder.models import (
-    StatisticData,
-    StatisticMeanType,
-    StatisticMetaData,
-)
-from homeassistant.components.recorder.statistics import (
-    async_add_external_statistics,
-    get_last_statistics,
-    statistics_during_period,
-)
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import CONF_EMAIL, CONF_PASSWORD, UnitOfEnergy
-from homeassistant.core import CoreState, HomeAssistant, callback
+from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed
-from homeassistant.helpers import storage
-from homeassistant.helpers.event import async_call_later, async_track_point_in_utc_time
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.helpers.aiohttp_client import async_create_clientsession
+from homeassistant.helpers.storage import Store
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+from homeassistant.util import dt as dt_util
 
-from .channels import enabled_channels, merge_channel_config, normalize_channel_config
+from .channels import enabled_channels
 from .const import (
-    CHANNEL_TYPE_IGNORE,
-    CONF_CHANNEL_CONFIG,
-    CONF_CHANNEL_NAME,
-    CONF_CHANNEL_TYPE,
-    CONF_CONSUMPTION_CHANNELS,
-    CONF_EXCLUDED_NMIS,
-    CONF_NMI_NAMES,
+    CONF_CHANNELS,
+    CONF_METER_NAMES,
     CONF_NMIS,
-    CONF_RETURN_CHANNELS,
-    DAILY_REFRESH_TIME,
-    DATA_AVAILABLE_TIME,
-    DEFAULT_CONSUMPTION_CHANNELS,
-    DEFAULT_RETURN_CHANNELS,
+    CONNECTION_RETRY_SECONDS,
+    DISCOVERY_DAYS,
     DOMAIN,
-    FORWARD_RECOVERY_DAYS,
-    FORWARD_RETRY_VERSION,
-    HISTORICAL_CHUNK_DAYS,
-    HISTORICAL_CHUNK_DELAY,
+    HISTORY_CHUNK_DAYS,
+    HISTORY_EMPTY_DAYS,
+    HISTORY_MAX_DAYS,
     LOGGER,
-    SAPN_TIME_ZONE,
-    STATISTICS_ALIGNMENT_VERSION,
-    STATUS_ATTENTION,
-    STATUS_BACKFILLING,
-    STATUS_IMPORTED,
-    STATUS_PARTIAL,
+    LOGIN_FAILURES_BEFORE_REAUTH,
+    PENDING_RETENTION_DAYS,
+    REQUEST_DELAY_SECONDS,
+    STATUS_ERROR,
+    STATUS_SYNCING,
     STATUS_UP_TO_DATE,
     STATUS_WAITING,
     STORE_VERSION,
-    UPDATE_INTERVAL,
 )
-from .meters import meter_type_label, supports_interval_data
-from .schedule import (
-    historical_chunk,
-    latest_available_date,
-    next_daily_refresh,
-    utc_statistic_window,
+from .portal import (
+    NEM12Error,
+    SAPNAuthError,
+    SAPNClient,
+    SAPNConnectionError,
+    SAPNError,
+    SAPNLoginFailedError,
+    SAPNNoDataError,
+    SAPNPortalError,
 )
+from .series import DaySummary, day_start_utc, merge_points, summarize_nem12
 from .statistics import (
-    HourlyPoint,
-    build_statistics,
-    derive_base_sum,
-    derive_prepend_base_sum,
+    async_merge_statistics,
+    async_replace_statistics,
     statistic_id,
-    statistic_name,
+    statistic_metadata,
+)
+from .timing import (
+    latest_published_day,
+    next_sync_after_error,
+    next_sync_after_success,
 )
 
+type SAPNConfigEntry = ConfigEntry[SAPNCoordinator]
+type ChannelDays = dict[str, dict[date, DaySummary]]
 
-class PortalAuthError(Exception):
-    """Authentication failed inside the blocking portal worker."""
-
-
-class PortalFetchError(Exception):
-    """A top-level portal operation failed inside the blocking worker."""
+ONE_DAY = timedelta(days=1)
 
 
 @dataclass(frozen=True, slots=True)
-class LocalDateRange:
-    """A half-open range of Adelaide calendar dates."""
+class MeterStatus:
+    """What is known about one meter after the latest sync."""
 
-    start: date
-    end: date
+    name: str
+    latest_day: date | None = None
+    pending_days: int = 0
+    waiting: bool = False
+    error: str | None = None
 
-    @property
-    def label(self) -> str:
-        """Return a concise user-facing range."""
-        if self.end == self.start + timedelta(days=1):
-            return self.start.isoformat()
-        final_date = self.end - timedelta(days=1)
-        return f"{self.start.isoformat()} to {final_date.isoformat()}"
+
+@dataclass(frozen=True, slots=True)
+class SyncStatus:
+    """The coordinator's data: the outcome of the latest sync."""
+
+    state: str
+    meters: dict[str, MeterStatus]
+    last_success: datetime | None = None
+    next_sync: datetime | None = None
+    error: str | None = None
 
 
 @dataclass(slots=True)
-class FetchBatch:
-    """Results from one blocking SAPN portal session."""
+class Stream:
+    """Import progress for one meter channel (one external statistic)."""
 
-    streams: dict[str, dict[str, Any]] = field(default_factory=dict)
-    no_data: dict[str, str] = field(default_factory=dict)
-    errors: dict[str, str] = field(default_factory=dict)
-    meter_names: dict[str, str] = field(default_factory=dict)
-    excluded_nmis: dict[str, str] = field(default_factory=dict)
-    channel_config: dict[str, dict[str, dict[str, str]]] = field(default_factory=dict)
-    ignored: set[str] = field(default_factory=set)
-    assignment_error: str | None = None
+    nmi: str
+    channel: str
+    first: date | None = None
+    last: date | None = None
+    pending: set[date] = field(default_factory=set)
 
-
-def _fetch_meter_data(
-    email: str,
-    password: str,
-    targets: dict[str, LocalDateRange],
-    consumption_channels: str,
-    return_channels: str,
-    channel_config: Mapping[str, Any],
-    discover_assignments: bool,
-) -> FetchBatch:
-    """Fetch and transform date ranges without blocking HA's event loop."""
-    from sapnmeterdata import (
-        AuthError,
-        FetchError,
-        LoginError,
-        NoDataError,
-        login,
-        meter,
-    )
-
-    from .transform import (
-        available_channels,
-        extract_hourly_channels,
-        stream_covers_window,
-    )
-
-    try:
-        client = login(email, password)
-    except (AuthError, LoginError) as err:
-        raise PortalAuthError(str(err)) from err
-    except FetchError as err:
-        raise PortalFetchError(str(err)) from err
-
-    result = FetchBatch()
-    if discover_assignments:
-        try:
-            assignments = client.getNMIAssignments()
-            result.meter_names = {
-                assignment.nmi: assignment.friendly_name for assignment in assignments
-            }
-            result.excluded_nmis = {
-                assignment.nmi: meter_type_label(assignment)
-                for assignment in assignments
-                if supports_interval_data(assignment) is False
-            }
-        except (AuthError, LoginError) as err:
-            raise PortalAuthError(str(err)) from err
-        except FetchError as err:
-            result.assignment_error = str(err)
-
-    for nmi, target in targets.items():
-        if nmi in result.excluded_nmis:
-            continue
-        # Adelaide midnight falls on a UTC half hour. Fetch the preceding local
-        # day so the first UTC-aligned hour has all its source intervals.
-        request_start = datetime.combine(
-            target.start - timedelta(days=1),
-            time.min,
-        )
-        request_end = datetime.combine(target.end, time.min)
-        window_start, window_end = utc_statistic_window(
-            target.start,
-            target.end,
-            SAPN_TIME_ZONE,
-        )
-        try:
-            frame = meter(nmi, client).getdata(request_start, request_end)
-        except (AuthError, LoginError) as err:
-            raise PortalAuthError(str(err)) from err
-        except NoDataError as err:
-            result.no_data[nmi] = str(err)
-        except FetchError as err:
-            result.errors[nmi] = str(err)
+    def next_day(self, latest: date) -> date:
+        """Return the oldest day this channel still needs."""
+        if self.last is None:
+            needed = latest - timedelta(days=DISCOVERY_DAYS - 1)
         else:
-            try:
-                discovered = {nmi: available_channels(frame, nmi)}
-                resolved = merge_channel_config(
-                    [nmi],
-                    discovered,
-                    channel_config,
-                    consumption_patterns=consumption_channels,
-                    return_patterns=return_channels,
-                )[nmi]
-                result.channel_config[nmi] = resolved
-                selected_channels = enabled_channels(resolved)
-                if not selected_channels:
-                    result.ignored.add(nmi)
-                    result.streams[nmi] = {}
-                    continue
-                streams = extract_hourly_channels(
-                    frame,
-                    nmi,
-                    selected_channels,
-                    SAPN_TIME_ZONE,
-                    window_start,
-                    window_end,
-                )
-                missing_channels = sorted(set(selected_channels) - set(streams))
-                incomplete_channels = sorted(
-                    channel
-                    for channel, stream in streams.items()
-                    if not stream_covers_window(stream, window_start, window_end)
-                )
-                if missing_channels or incomplete_channels:
-                    details: list[str] = []
-                    if missing_channels:
-                        details.append(
-                            "missing channel(s): " + ", ".join(missing_channels)
-                        )
-                    if incomplete_channels:
-                        details.append(
-                            "partial channel(s): " + ", ".join(incomplete_channels)
-                        )
-                    result.no_data[nmi] = (
-                        "SAPN returned incomplete interval data ("
-                        + "; ".join(details)
-                        + ")."
-                    )
-                    continue
-                result.streams[nmi] = streams
-            except (TypeError, ValueError) as err:
-                result.errors[nmi] = str(err)
-    return result
+            needed = self.last + ONE_DAY
+        return min([needed, *self.pending])
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return a JSON-serialisable representation."""
+        return {
+            "nmi": self.nmi,
+            "channel": self.channel,
+            "first": self.first.isoformat() if self.first else None,
+            "last": self.last.isoformat() if self.last else None,
+            "pending": sorted(day.isoformat() for day in self.pending),
+        }
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> Stream:
+        """Restore a stream saved by ``as_dict``."""
+        return cls(
+            nmi=raw["nmi"],
+            channel=raw["channel"],
+            first=date.fromisoformat(raw["first"]) if raw.get("first") else None,
+            last=date.fromisoformat(raw["last"]) if raw.get("last") else None,
+            pending={date.fromisoformat(day) for day in raw.get("pending", [])},
+        )
 
 
-class SAPNMeterDataCoordinator(DataUpdateCoordinator[dict[str, Any]]):
-    """Fetch complete SAPN periods and import them as external statistics."""
+@contextmanager
+def portal_session(hass: HomeAssistant) -> Iterator[aiohttp.ClientSession]:
+    """Yield a client session with its own cookie jar for one portal login."""
+    session = async_create_clientsession(hass, auto_cleanup=False)
+    try:
+        yield session
+    finally:
+        # Sessions from Home Assistant share its connector, so they are
+        # detached rather than closed.
+        session.detach()
 
-    config_entry: ConfigEntry
 
-    def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
+def _merge_days(target: ChannelDays, source: ChannelDays) -> ChannelDays:
+    for channel, days in source.items():
+        target.setdefault(channel, {}).update(days)
+    return target
+
+
+def _newest_day(data: ChannelDays) -> date | None:
+    return max((day for days in data.values() for day in days), default=None)
+
+
+class SAPNCoordinator(DataUpdateCoordinator[SyncStatus]):
+    """Sync SAPN meter data into long-term statistics on a schedule."""
+
+    config_entry: SAPNConfigEntry
+
+    def __init__(self, hass: HomeAssistant, entry: SAPNConfigEntry) -> None:
         """Initialize the coordinator."""
         super().__init__(
             hass,
             LOGGER,
             config_entry=entry,
             name=DOMAIN,
-            update_interval=UPDATE_INTERVAL,
+            # Set after every sync from SAPN's publication schedule.
+            update_interval=None,
         )
-        self._entry = entry
-        self._store = storage.Store[dict[str, Any]](
-            hass,
-            STORE_VERSION,
-            f"{DOMAIN}.{entry.entry_id}",
+        self._store: Store[dict[str, Any]] = Store(
+            hass, STORE_VERSION, f"{DOMAIN}.{entry.entry_id}"
         )
-        self._state: dict[str, Any] | None = None
-        self._unsub_daily_refresh: Callable[[], None] | None = None
-        self._unsub_backfill_refresh: Callable[[], None] | None = None
+        self._streams: dict[str, Stream] = {}
+        self._lock = asyncio.Lock()
+        self._failures = 0
+        self._login_failures = 0
+        self._last_success: datetime | None = None
+        self._meter_errors: dict[str, str] = {}
+        self._waiting: set[str] = set()
+        self._next_request = 0.0
 
-    @staticmethod
-    def _meter_name_map(
-        nmis: list[str],
-        *sources: Mapping[str, Any],
-    ) -> dict[str, str]:
-        """Return non-empty friendly names with an NMI fallback."""
-        names = {nmi: nmi for nmi in nmis}
-        for source in sources:
-            for nmi in nmis:
-                value = str(source.get(nmi, "")).strip()
-                if value:
-                    names[nmi] = value
-        return names
+    @property
+    def nmis(self) -> list[str]:
+        """Return the selected meters."""
+        return list(self.config_entry.options.get(CONF_NMIS, []))
 
-    @callback
-    def startup_data(self) -> dict[str, Any]:
-        """Return safe placeholder data while Home Assistant is starting."""
-        config = {**self._entry.data, **self._entry.options}
-        configured_nmis = [str(nmi) for nmi in config[CONF_NMIS]]
-        excluded_nmis = {
-            str(nmi): str(meter_type)
-            for nmi, meter_type in config.get(CONF_EXCLUDED_NMIS, {}).items()
+    def meter_name(self, nmi: str) -> str:
+        """Return a meter's display name."""
+        return self.config_entry.options.get(CONF_METER_NAMES, {}).get(nmi) or nmi
+
+    async def async_load(self) -> None:
+        """Restore saved progress and publish an initial status."""
+        stored = await self._store.async_load() or {}
+        self._streams = {
+            stat_id: Stream.from_dict(raw)
+            for stat_id, raw in stored.get("streams", {}).items()
         }
-        nmis = [nmi for nmi in configured_nmis if nmi not in excluded_nmis]
-        known_nmis = list(dict.fromkeys([*configured_nmis, *excluded_nmis]))
-        meter_names = self._meter_name_map(
-            known_nmis,
-            config.get(CONF_NMI_NAMES, {}),
-        )
-        channel_config = merge_channel_config(
-            nmis,
-            {},
-            config.get(CONF_CHANNEL_CONFIG, {}),
-            consumption_patterns=config.get(
-                CONF_CONSUMPTION_CHANNELS,
-                DEFAULT_CONSUMPTION_CHANNELS,
-            ),
-            return_patterns=config.get(
-                CONF_RETURN_CHANNELS,
-                DEFAULT_RETURN_CHANNELS,
-            ),
-        )
-        available_day = latest_available_date(
-            datetime.now(UTC),
-            SAPN_TIME_ZONE,
-            DATA_AVAILABLE_TIME,
-        )
-        return {
-            "status": STATUS_WAITING,
-            "latest_available_day": available_day.isoformat(),
-            "requested_dates": {},
-            "request_type": None,
-            "imported": [],
-            "waiting": [],
-            "waiting_details": {},
-            "skipped": [],
-            "ignored": [],
-            "excluded": sorted(excluded_nmis),
-            "excluded_meters": {
-                nmi: {
-                    "name": meter_names.get(nmi, nmi),
-                    "meter_type": meter_type,
-                }
-                for nmi, meter_type in excluded_nmis.items()
-            },
-            "errors": {},
-            "channels": {},
-            "statistics": {},
-            "meter_names": {nmi: meter_names[nmi] for nmi in nmis},
-            "channel_config": channel_config,
-            "last_processed": {},
-            "earliest_processed": {},
-            "historical_backfill": {
-                "active": False,
-                "chunk_days": HISTORICAL_CHUNK_DAYS,
-                "before": {},
-                "completed": [],
-                "failed": {},
-                "chunks_imported": 0,
-            },
-            "last_successful_import": None,
-            "startup_pending": True,
-        }
+        if last_success := stored.get("last_success"):
+            self._last_success = dt_util.parse_datetime(last_success)
+        self.data = self._status(STATUS_SYNCING)
 
-    async def async_start_after_hass(self, _hass: HomeAssistant) -> None:
-        """Run the first portal and Recorder work after bootstrap completes."""
-        self.async_start_daily_refresh()
-        await self.async_request_refresh()
-
-    @callback
-    def async_start_daily_refresh(self) -> None:
-        """Schedule a refresh just after SAPN publishes the previous day."""
-        self._schedule_daily_refresh(datetime.now(UTC))
-        self._entry.async_on_unload(self._cancel_refresh_schedules)
-
-    @callback
-    def _schedule_daily_refresh(self, now: datetime) -> None:
-        """Schedule the next 03:05 Adelaide refresh."""
-        refresh_at = next_daily_refresh(
-            now,
-            SAPN_TIME_ZONE,
-            DAILY_REFRESH_TIME,
-        )
-        self._unsub_daily_refresh = async_track_point_in_utc_time(
-            self.hass,
-            self._async_daily_refresh,
-            refresh_at,
-        )
-        LOGGER.debug("Next SAPN daily import scheduled for %s", refresh_at)
-
-    async def _async_daily_refresh(self, now: datetime) -> None:
-        """Refresh and schedule the following daily run."""
-        self._unsub_daily_refresh = None
-        self._schedule_daily_refresh(now)
-        await self.async_request_refresh()
-
-    @callback
-    def _schedule_backfill_refresh(self) -> None:
-        """Schedule the next rate-limited historical chunk."""
-        if self._unsub_backfill_refresh is not None:
-            return
-        self._unsub_backfill_refresh = async_call_later(
-            self.hass,
-            HISTORICAL_CHUNK_DELAY,
-            self._async_backfill_refresh,
-        )
-
-    async def _async_backfill_refresh(self, _now: datetime) -> None:
-        """Import the next historical chunk."""
-        self._unsub_backfill_refresh = None
-        await self.async_request_refresh()
-
-    @callback
-    def _cancel_refresh_schedules(self) -> None:
-        """Cancel daily and historical refresh callbacks."""
-        if self._unsub_daily_refresh is not None:
-            self._unsub_daily_refresh()
-            self._unsub_daily_refresh = None
-        if self._unsub_backfill_refresh is not None:
-            self._unsub_backfill_refresh()
-            self._unsub_backfill_refresh = None
-
-    async def _async_load_state(self) -> dict[str, Any]:
-        """Load the import checkpoint once."""
-        if self._state is None:
-            loaded = await self._store.async_load()
-            self._state = dict(loaded or {})
-            self._state.setdefault("last_processed", {})
-            self._state.setdefault("earliest_processed", {})
-            self._state.setdefault("meter_names", {})
-            self._state.setdefault("excluded_nmis", {})
-            self._state.setdefault("channel_config", {})
-            self._state.setdefault(
-                "historical_backfill",
-                {
-                    "active": False,
-                    "before": {},
-                    "completed": [],
-                    "failed": {},
-                    "chunks_imported": 0,
+    async def _async_save(self) -> None:
+        await self._store.async_save(
+            {
+                "streams": {
+                    stat_id: stream.as_dict()
+                    for stat_id, stream in self._streams.items()
                 },
-            )
-        return self._state
-
-    async def _async_migrate_forward_retries(
-        self,
-        state: dict[str, Any],
-        nmis: list[str],
-    ) -> None:
-        """Recheck recent dates once after replacing permanent skips with retries."""
-        if state.get("forward_retry_version") == FORWARD_RETRY_VERSION:
-            return
-
-        last_processed = state["last_processed"]
-        rewound: dict[str, str] = {}
-        for nmi in nmis:
-            stored = last_processed.get(nmi)
-            if not stored:
-                continue
-            try:
-                processed_date = date.fromisoformat(stored)
-            except ValueError:
-                continue
-            checkpoint = processed_date - timedelta(days=FORWARD_RECOVERY_DAYS)
-            last_processed[nmi] = checkpoint.isoformat()
-            rewound[nmi] = checkpoint.isoformat()
-
-        state["forward_retry_version"] = FORWARD_RETRY_VERSION
-        await self._store.async_save(state)
-        if rewound:
-            LOGGER.info(
-                "Rewound %d SAPN forward checkpoint(s) by %d days to recover "
-                "dates skipped by earlier versions",
-                len(rewound),
-                FORWARD_RECOVERY_DAYS,
-            )
-
-    async def _async_migrate_statistics_alignment(
-        self,
-        state: dict[str, Any],
-        nmis: list[str],
-    ) -> None:
-        """Clear legacy aggregate statistics before per-channel importing."""
-        if state.get("statistics_alignment_version") == STATISTICS_ALIGNMENT_VERSION:
-            return
-
-        stat_ids = [
-            statistic_id(nmi, direction)
-            for nmi in nmis
-            for direction in ("consumption", "return")
-        ]
-        recorder = get_instance(self.hass)
-        recorder.async_clear_statistics(stat_ids)
-        await recorder.async_block_till_done()
-        state["statistics_alignment_version"] = STATISTICS_ALIGNMENT_VERSION
-        state["last_processed"] = {}
-        state["earliest_processed"] = {}
-        state["historical_backfill"] = {
-            "active": False,
-            "before": {},
-            "completed": [],
-            "failed": {},
-            "chunks_imported": 0,
-        }
-        state.pop("last_successful_import", None)
-        await self._store.async_save(state)
-        LOGGER.info("Reset legacy SAPN aggregate statistics for per-channel import")
-
-    async def _async_handle_channel_config_change(
-        self,
-        state: dict[str, Any],
-        configured_channels: Any,
-    ) -> None:
-        """Restart checkpoints when the user changes enabled channel streams."""
-        normalized = normalize_channel_config(configured_channels)
-        previous = state.get("configured_channel_config")
-        if previous == normalized:
-            return
-
-        state["configured_channel_config"] = normalized
-        if previous is not None:
-            state["last_processed"] = {}
-            state["earliest_processed"] = {}
-            state["historical_backfill"] = {
-                "active": False,
-                "before": {},
-                "completed": [],
-                "failed": {},
-                "chunks_imported": 0,
-            }
-            state.pop("last_successful_import", None)
-            LOGGER.info("Reset SAPN checkpoints after channel configuration changed")
-        await self._store.async_save(state)
-
-    @staticmethod
-    def _target_dates(
-        nmis: list[str],
-        last_processed: dict[str, str],
-        latest_available_day: date,
-    ) -> dict[str, date]:
-        """Return the next available forward date due for each NMI."""
-        targets: dict[str, date] = {}
-        for nmi in nmis:
-            stored = last_processed.get(nmi)
-            if stored:
-                try:
-                    target = date.fromisoformat(stored) + timedelta(days=1)
-                except ValueError:
-                    target = latest_available_day
-            else:
-                target = latest_available_day
-            if target <= latest_available_day:
-                targets[nmi] = target
-        return targets
-
-    @staticmethod
-    def _historical_ranges(
-        nmis: list[str],
-        state: dict[str, Any],
-        latest_available_day: date,
-    ) -> dict[str, LocalDateRange]:
-        """Return one backwards chunk for each active NMI."""
-        backfill = state["historical_backfill"]
-        if not backfill.get("active"):
-            return {}
-
-        completed = set(backfill.get("completed", []))
-        failed = set(backfill.get("failed", {}))
-        before_by_nmi = backfill.setdefault("before", {})
-        earliest = state["earliest_processed"]
-        last_processed = state["last_processed"]
-        ranges: dict[str, LocalDateRange] = {}
-        for nmi in nmis:
-            if nmi in completed or nmi in failed:
-                continue
-            before_raw = before_by_nmi.get(nmi)
-            if before_raw is None:
-                before_raw = earliest.get(nmi) or last_processed.get(nmi)
-            try:
-                before = (
-                    date.fromisoformat(before_raw)
-                    if before_raw
-                    else latest_available_day + timedelta(days=1)
-                )
-            except ValueError:
-                before = latest_available_day + timedelta(days=1)
-            start, end = historical_chunk(before, HISTORICAL_CHUNK_DAYS)
-            before_by_nmi[nmi] = before.isoformat()
-            ranges[nmi] = LocalDateRange(start, end)
-        return ranges
-
-    async def async_start_historical_backfill(self) -> None:
-        """Start or restart the resumable historical import."""
-        state = await self._async_load_state()
-        config = {**self._entry.data, **self._entry.options}
-        configured_nmis = [str(nmi) for nmi in config[CONF_NMIS]]
-        excluded_nmis = {
-            **{
-                str(nmi): str(meter_type)
-                for nmi, meter_type in config.get(CONF_EXCLUDED_NMIS, {}).items()
-            },
-            **{
-                str(nmi): str(meter_type)
-                for nmi, meter_type in state.get("excluded_nmis", {}).items()
-            },
-        }
-        nmis = [nmi for nmi in configured_nmis if nmi not in excluded_nmis]
-        available_day = latest_available_date(
-            datetime.now(UTC),
-            SAPN_TIME_ZONE,
-            DATA_AVAILABLE_TIME,
-        )
-        earliest = state["earliest_processed"]
-        last_processed = state["last_processed"]
-        backfill = state["historical_backfill"]
-        backfill["active"] = True
-        backfill["completed"] = []
-        backfill["failed"] = {}
-        backfill["before"] = {
-            nmi: (
-                earliest.get(nmi)
-                or last_processed.get(nmi)
-                or (available_day + timedelta(days=1)).isoformat()
-            )
-            for nmi in nmis
-        }
-        await self._store.async_save(state)
-        await self.async_request_refresh()
-
-    async def _async_fetch_ranges(
-        self,
-        config: dict[str, Any],
-        targets: dict[str, LocalDateRange],
-        discover_assignments: bool,
-        channel_config: Mapping[str, Any],
-    ) -> FetchBatch:
-        """Fetch one forward or historical batch."""
-        try:
-            return await self.hass.async_add_executor_job(
-                _fetch_meter_data,
-                config[CONF_EMAIL],
-                config[CONF_PASSWORD],
-                targets,
-                config.get(
-                    CONF_CONSUMPTION_CHANNELS,
-                    DEFAULT_CONSUMPTION_CHANNELS,
+                "last_success": (
+                    self._last_success.isoformat() if self._last_success else None
                 ),
-                config.get(CONF_RETURN_CHANNELS, DEFAULT_RETURN_CHANNELS),
-                channel_config,
-                discover_assignments,
-            )
-        except PortalAuthError as err:
-            raise ConfigEntryAuthFailed(str(err)) from err
-        except PortalFetchError as err:
-            raise UpdateFailed(str(err)) from err
-        except Exception as err:
-            LOGGER.exception("Unexpected error while contacting SAPN")
-            raise UpdateFailed(str(err)) from err
-
-    async def _async_existing_statistics(
-        self,
-        stat_id: str,
-        points: tuple[HourlyPoint, ...],
-        mode: Literal["forward", "backfill"],
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        """Load rows needed to append, replace, or prepend a cumulative sum."""
-        recorder = get_instance(self.hass)
-        start = points[0].start
-        end = points[-1].start + timedelta(hours=1)
-        existing_result = await recorder.async_add_executor_job(
-            statistics_during_period,
-            self.hass,
-            start,
-            end,
-            {stat_id},
-            "hour",
-            None,
-            {"state", "sum"},
+            }
         )
-        existing = list(existing_result.get(stat_id, []))
 
-        if mode == "forward":
-            reference_result = await recorder.async_add_executor_job(
-                get_last_statistics,
-                self.hass,
-                1,
-                stat_id,
-                False,
-                {"state", "sum"},
+    @callback
+    def async_start(self, _hass: HomeAssistant | None = None) -> None:
+        """Run the first sync in the background once Home Assistant is up."""
+        self.config_entry.async_create_background_task(
+            self.hass, self.async_refresh(), f"{DOMAIN} sync"
+        )
+
+    def stream_diagnostics(self) -> dict[str, dict[str, Any]]:
+        """Return import progress for diagnostics."""
+        return {stat_id: stream.as_dict() for stat_id, stream in self._streams.items()}
+
+    def _known_channels(self, nmi: str) -> set[str]:
+        return {
+            stream.channel for stream in self._streams.values() if stream.nmi == nmi
+        }
+
+    def _status(
+        self,
+        state: str,
+        next_sync: datetime | None = None,
+        error: str | None = None,
+    ) -> SyncStatus:
+        meters: dict[str, MeterStatus] = {}
+        for nmi in self.nmis:
+            channels = enabled_channels(
+                self.config_entry.options, nmi, self._known_channels(nmi)
+            )
+            streams = [
+                self._streams[stat_id]
+                for channel in channels
+                if (stat_id := statistic_id(nmi, channel)) in self._streams
+            ]
+            lasts = [stream.last for stream in streams if stream.last]
+            pending: set[date] = set().union(*(stream.pending for stream in streams))
+            meters[nmi] = MeterStatus(
+                name=self.meter_name(nmi),
+                latest_day=min(lasts) if lasts else None,
+                pending_days=len(pending),
+                waiting=nmi in self._waiting,
+                error=self._meter_errors.get(nmi),
+            )
+        return SyncStatus(
+            state=state,
+            meters=meters,
+            last_success=self._last_success,
+            next_sync=next_sync,
+            error=error,
+        )
+
+    def _schedule(self, next_sync: datetime) -> None:
+        self.update_interval = max(next_sync - dt_util.utcnow(), timedelta(minutes=1))
+
+    async def _async_update_data(self) -> SyncStatus:
+        """Run one sync and decide when the next one should happen."""
+        async with self._lock:
+            if self.data is not None:
+                self.data = replace(self.data, state=STATUS_SYNCING)
+                self.async_update_listeners()
+            try:
+                waiting = await self._async_sync()
+            except SAPNAuthError as err:
+                raise ConfigEntryAuthFailed(f"SAPN rejected the login: {err}") from err
+            except SAPNLoginFailedError as err:
+                self._login_failures += 1
+                if self._login_failures >= LOGIN_FAILURES_BEFORE_REAUTH:
+                    raise ConfigEntryAuthFailed(
+                        f"Signing in to SAPN failed {self._login_failures} times "
+                        f"in a row: {err}"
+                    ) from err
+                return self._failed(err)
+            except SAPNError as err:
+                return self._failed(err)
+            except Exception as err:
+                LOGGER.exception("Unexpected error while syncing SAPN meter data")
+                return self._failed(err)
+
+            self._login_failures = 0
+            if self._meter_errors:
+                return self._failed(
+                    "; ".join(
+                        f"{self.meter_name(nmi)}: {message}"
+                        for nmi, message in self._meter_errors.items()
+                    )
+                )
+            if self._failures:
+                LOGGER.info("SAPN meter data sync is working again")
+            self._failures = 0
+            self._last_success = dt_util.utcnow()
+            await self._async_save()
+            next_sync = next_sync_after_success(dt_util.utcnow(), waiting)
+            self._schedule(next_sync)
+            return self._status(
+                STATUS_WAITING if waiting else STATUS_UP_TO_DATE, next_sync
+            )
+
+    def _failed(self, err: Exception | str) -> SyncStatus:
+        self._failures += 1
+        next_sync = next_sync_after_error(dt_util.utcnow(), self._failures)
+        log = LOGGER.warning if self._failures == 1 else LOGGER.debug
+        log("SAPN meter data sync failed, retrying at %s: %s", next_sync, err)
+        self._schedule(next_sync)
+        return self._status(STATUS_ERROR, next_sync, str(err))
+
+    async def _async_sync(self) -> bool:
+        """Sync every selected meter; return whether SAPN is behind schedule."""
+        latest = latest_published_day(dt_util.utcnow())
+        with portal_session(self.hass) as session:
+            client = SAPNClient(
+                session,
+                self.config_entry.data[CONF_EMAIL],
+                self.config_entry.data[CONF_PASSWORD],
+            )
+            await client.login()
+            self._waiting.clear()
+            self._meter_errors = {
+                nmi: message
+                for nmi, message in self._meter_errors.items()
+                if nmi in self.nmis
+            }
+            for nmi in self.nmis:
+                try:
+                    if await self._async_sync_meter(client, nmi, latest):
+                        self._waiting.add(nmi)
+                except (SAPNAuthError, SAPNLoginFailedError, SAPNConnectionError):
+                    raise
+                except SAPNError as err:
+                    LOGGER.debug("Sync of SAPN meter %s failed: %s", nmi, err)
+                    self._meter_errors[nmi] = str(err)
+                else:
+                    self._meter_errors.pop(nmi, None)
+                finally:
+                    await self._async_save()
+        return bool(self._waiting)
+
+    async def _async_sync_meter(
+        self,
+        client: SAPNClient,
+        nmi: str,
+        latest: date,
+    ) -> bool:
+        """Sync one meter; return whether its newest published day is missing."""
+        options = self.config_entry.options
+        known = self._known_channels(nmi)
+        enabled = enabled_channels(options, nmi, known)
+        if not enabled and (known or options.get(CONF_CHANNELS, {}).get(nmi)):
+            return False  # Every channel of this meter is set to Ignore.
+        imported = {
+            channel: self._streams[stat_id]
+            for channel in enabled
+            if (stat_id := statistic_id(nmi, channel)) in self._streams
+        }
+
+        if enabled and len(imported) == len(enabled):
+            start = min(stream.next_day(latest) for stream in imported.values())
+            data: ChannelDays = {}
+            if start <= latest:
+                data = await self._async_fetch_range(client, nmi, start, latest)
+            enabled = enabled_channels(options, nmi, known | set(data))
+            new_channels = [channel for channel in enabled if channel not in imported]
+            history = (
+                await self._async_fetch_history(client, nmi, latest)
+                if new_channels
+                else {}
             )
         else:
-            reference_result = await recorder.async_add_executor_job(
-                statistics_during_period,
-                self.hass,
-                end,
-                end + timedelta(hours=1),
-                {stat_id},
-                "hour",
-                None,
-                {"state", "sum"},
-            )
-        return existing, list(reference_result.get(stat_id, []))
+            # Some enabled channel has never been imported, or the meter's
+            # channels are not known yet: request the meter's full history.
+            data = history = await self._async_fetch_history(client, nmi, latest)
+            enabled = enabled_channels(options, nmi, known | set(history))
 
-    async def _async_import_stream(
+        newest = _newest_day(data)
+        for channel, name in enabled.items():
+            stat_id = statistic_id(nmi, channel)
+            if stream := self._streams.get(stat_id):
+                await self._async_apply(
+                    stream, name, data.get(channel, {}), newest, latest
+                )
+            else:
+                await self._async_import_history(
+                    nmi, channel, name, history.get(channel, {}), latest
+                )
+
+        lasts = [
+            stream.last
+            for channel in enabled
+            if (stream := self._streams.get(statistic_id(nmi, channel))) and stream.last
+        ]
+        return bool(lasts) and max(lasts) < latest
+
+    def _statistic_name(self, nmi: str, channel_name: str) -> str:
+        return f"SAPN {self.meter_name(nmi)} {channel_name}"
+
+    async def _async_import_history(
         self,
         nmi: str,
         channel: str,
-        points: tuple[HourlyPoint, ...],
-        mode: Literal["forward", "backfill"],
-        friendly_name: str,
-        channel_name: str,
-    ) -> str:
-        """Import one independently configured NEM12 channel."""
+        name: str,
+        days: Mapping[date, DaySummary],
+        latest: date,
+    ) -> None:
+        """Replace a statistic with a channel's complete history."""
         stat_id = statistic_id(nmi, channel)
-        existing, reference = await self._async_existing_statistics(
-            stat_id,
-            points,
-            mode,
-        )
-        if mode == "backfill":
-            base_sum = derive_prepend_base_sum(points, existing, reference)
-            include_baseline = False
-        else:
-            base_sum, include_baseline = derive_base_sum(
+        stream = Stream(nmi=nmi, channel=channel)
+        points = merge_points(days.values())
+        if points:
+            await async_replace_statistics(
+                self.hass,
+                statistic_metadata(stat_id, self._statistic_name(nmi, name)),
                 points,
-                existing,
-                reference,
             )
-        rows = build_statistics(points, base_sum, include_baseline)
-
-        metadata: StatisticMetaData = {
-            "mean_type": StatisticMeanType.NONE,
-            "has_sum": True,
-            "name": statistic_name(
+            stream.first, stream.last = min(days), max(days)
+            stream.pending = {day for day, summary in days.items() if not summary.final}
+            horizon = latest - timedelta(days=PENDING_RETENTION_DAYS)
+            stream.pending.update(
+                self._missing_days(days, max(stream.first, horizon), stream.last)
+            )
+            self._prune_pending(stream, latest)
+            LOGGER.info(
+                "Imported SAPN history for %s %s from %s to %s",
                 nmi,
                 channel,
-                friendly_name,
-                channel_name,
-            ),
-            "source": DOMAIN,
-            "statistic_id": stat_id,
-            "unit_class": "energy",
-            "unit_of_measurement": UnitOfEnergy.KILO_WATT_HOUR,
-        }
-        async_add_external_statistics(
-            self.hass,
-            metadata,
-            [StatisticData(**row) for row in rows],
-        )
-        return stat_id
-
-    @staticmethod
-    def _backfill_snapshot(state: dict[str, Any]) -> dict[str, Any]:
-        """Return a copy suitable for status attributes."""
-        backfill = state["historical_backfill"]
-        return {
-            "active": bool(backfill.get("active")),
-            "chunk_days": HISTORICAL_CHUNK_DAYS,
-            "before": dict(backfill.get("before", {})),
-            "completed": list(backfill.get("completed", [])),
-            "failed": dict(backfill.get("failed", {})),
-            "chunks_imported": int(backfill.get("chunks_imported", 0)),
-        }
-
-    @staticmethod
-    def _merge_meter_names(
-        state: dict[str, Any],
-        meter_names: dict[str, str],
-        discovered_names: Mapping[str, str],
-    ) -> bool:
-        """Merge newly discovered friendly names into memory and storage."""
-        stored_names = state.setdefault("meter_names", {})
-        changed = False
-        for nmi in meter_names:
-            friendly_name = str(discovered_names.get(nmi, "")).strip()
-            if not friendly_name:
-                continue
-            meter_names[nmi] = friendly_name
-            if stored_names.get(nmi) != friendly_name:
-                stored_names[nmi] = friendly_name
-                changed = True
-        return changed
-
-    @staticmethod
-    def _merge_excluded_nmis(
-        state: dict[str, Any],
-        excluded_nmis: dict[str, str],
-        discovered_exclusions: Mapping[str, str],
-    ) -> bool:
-        """Persist non-interval assignments discovered from the portal."""
-        stored_exclusions = state.setdefault("excluded_nmis", {})
-        changed = False
-        for nmi, meter_type in discovered_exclusions.items():
-            label = str(meter_type).strip() or "Non-interval meter"
-            excluded_nmis[nmi] = label
-            if stored_exclusions.get(nmi) != label:
-                stored_exclusions[nmi] = label
-                LOGGER.info(
-                    "Excluding SAPN meter %s because it is a %s",
-                    nmi,
-                    label,
-                )
-                changed = True
-        return changed
-
-    @staticmethod
-    def _merge_channel_definitions(
-        state: dict[str, Any],
-        channel_config: dict[str, dict[str, dict[str, str]]],
-        discovered_config: Mapping[str, Mapping[str, Mapping[str, str]]],
-    ) -> bool:
-        """Persist newly found channels without overriding configured values."""
-        stored = state.setdefault("channel_config", {})
-        changed = False
-        for nmi, discovered_channels in discovered_config.items():
-            meter_config = channel_config.setdefault(nmi, {})
-            stored_meter = stored.setdefault(nmi, {})
-            for channel, definition in discovered_channels.items():
-                normalized = {
-                    CONF_CHANNEL_NAME: str(definition.get(CONF_CHANNEL_NAME, channel)),
-                    CONF_CHANNEL_TYPE: str(
-                        definition.get(CONF_CHANNEL_TYPE, CHANNEL_TYPE_IGNORE)
-                    ),
-                }
-                meter_config[channel] = normalized
-                if stored_meter.get(channel) != normalized:
-                    stored_meter[channel] = normalized
-                    changed = True
-        return changed
-
-    @override
-    async def _async_update_data(self) -> dict[str, Any]:
-        """Fetch the newest day or one rate-limited historical chunk."""
-        if self.hass.state is not CoreState.running:
-            return self.startup_data()
-
-        state = await self._async_load_state()
-        config = {**self._entry.data, **self._entry.options}
-        configured_nmis = [str(nmi) for nmi in config[CONF_NMIS]]
-        excluded_nmis = {
-            **{
-                str(nmi): str(meter_type)
-                for nmi, meter_type in config.get(CONF_EXCLUDED_NMIS, {}).items()
-            },
-            **{
-                str(nmi): str(meter_type)
-                for nmi, meter_type in state.get("excluded_nmis", {}).items()
-            },
-        }
-        nmis = [nmi for nmi in configured_nmis if nmi not in excluded_nmis]
-        known_nmis = list(dict.fromkeys([*configured_nmis, *excluded_nmis]))
-        await self._async_migrate_statistics_alignment(state, nmis)
-        await self._async_handle_channel_config_change(
-            state,
-            config.get(CONF_CHANNEL_CONFIG, {}),
-        )
-        await self._async_migrate_forward_retries(state, nmis)
-        meter_names = self._meter_name_map(
-            known_nmis,
-            state.get("meter_names", {}),
-            config.get(CONF_NMI_NAMES, {}),
-        )
-        channel_config = merge_channel_config(
-            nmis,
-            {},
-            state.get("channel_config", {}),
-            config.get(CONF_CHANNEL_CONFIG, {}),
-            consumption_patterns=config.get(
-                CONF_CONSUMPTION_CHANNELS,
-                DEFAULT_CONSUMPTION_CHANNELS,
-            ),
-            return_patterns=config.get(
-                CONF_RETURN_CHANNELS,
-                DEFAULT_RETURN_CHANNELS,
-            ),
-        )
-
-        last_processed: dict[str, str] = state["last_processed"]
-        earliest_processed: dict[str, str] = state["earliest_processed"]
-        available_day = latest_available_date(
-            datetime.now(UTC),
-            SAPN_TIME_ZONE,
-            DATA_AVAILABLE_TIME,
-        )
-        forward_dates = self._target_dates(
-            nmis,
-            last_processed,
-            available_day,
-        )
-
-        mode: Literal["forward", "backfill"] = "forward"
-        targets = {
-            nmi: LocalDateRange(target, target + timedelta(days=1))
-            for nmi, target in forward_dates.items()
-        }
-        if not targets:
-            mode = "backfill"
-            targets = self._historical_ranges(nmis, state, available_day)
-
-        requested_dates = {nmi: target.label for nmi, target in targets.items()}
-        base_result: dict[str, Any] = {
-            "status": STATUS_UP_TO_DATE,
-            "latest_available_day": available_day.isoformat(),
-            "requested_dates": requested_dates,
-            "request_type": mode if targets else None,
-            "imported": [],
-            "waiting": [],
-            "waiting_details": {},
-            "skipped": [],
-            "ignored": [],
-            "excluded": sorted(excluded_nmis),
-            "excluded_meters": {
-                nmi: {
-                    "name": meter_names.get(nmi, nmi),
-                    "meter_type": meter_type,
-                }
-                for nmi, meter_type in excluded_nmis.items()
-            },
-            "errors": {},
-            "channels": {},
-            "statistics": {},
-            "meter_names": {nmi: meter_names[nmi] for nmi in nmis},
-            "channel_config": channel_config,
-            "name_discovery_error": None,
-            "last_processed": dict(last_processed),
-            "earliest_processed": dict(earliest_processed),
-            "historical_backfill": self._backfill_snapshot(state),
-            "last_successful_import": state.get("last_successful_import"),
-        }
-        discover_meter_names = any(meter_names[nmi] == nmi for nmi in configured_nmis)
-        if not targets:
-            if not discover_meter_names and state.get("assignments_checked"):
-                return base_result
-            batch = await self._async_fetch_ranges(
-                config,
-                {},
-                True,
-                channel_config,
+                stream.first,
+                stream.last,
             )
-            state_changed = self._merge_meter_names(
-                state,
-                meter_names,
-                batch.meter_names,
-            )
-            state_changed = (
-                self._merge_excluded_nmis(
-                    state,
-                    excluded_nmis,
-                    batch.excluded_nmis,
-                )
-                or state_changed
-            )
-            if batch.assignment_error is None:
-                state["assignments_checked"] = True
-                state_changed = True
-            if state_changed:
-                await self._store.async_save(state)
-            base_result["excluded"] = sorted(excluded_nmis)
-            base_result["excluded_meters"] = {
-                nmi: {
-                    "name": meter_names.get(nmi, nmi),
-                    "meter_type": meter_type,
-                }
-                for nmi, meter_type in excluded_nmis.items()
-            }
-            base_result["meter_names"] = {
-                nmi: meter_names[nmi]
-                for nmi in configured_nmis
-                if nmi not in excluded_nmis
-            }
-            base_result["channel_config"] = {
-                nmi: definitions
-                for nmi, definitions in channel_config.items()
-                if nmi not in excluded_nmis
-            }
-            base_result["name_discovery_error"] = batch.assignment_error
-            return base_result
-
-        batch = await self._async_fetch_ranges(
-            config,
-            targets,
-            True,
-            channel_config,
-        )
-        state_changed = self._merge_meter_names(
-            state,
-            meter_names,
-            batch.meter_names,
-        )
-        state_changed = (
-            self._merge_excluded_nmis(
-                state,
-                excluded_nmis,
-                batch.excluded_nmis,
-            )
-            or state_changed
-        )
-        if batch.assignment_error is None:
-            state["assignments_checked"] = True
-            state_changed = True
-        state_changed = (
-            self._merge_channel_definitions(
-                state,
-                channel_config,
-                batch.channel_config,
-            )
-            or state_changed
-        )
-        imported: list[str] = []
-        waiting: list[str] = []
-        skipped: list[str] = []
-        ignored = sorted(batch.ignored)
-        excluded = sorted(batch.excluded_nmis)
-        errors = dict(batch.errors)
-        channels: dict[str, dict[str, dict[str, str]]] = {}
-        statistics: dict[str, dict[str, str]] = {}
-        queued_statistics = False
-        backfill_progress = False
-
-        if mode == "forward":
-            for nmi in excluded:
-                last_processed.pop(nmi, None)
-                earliest_processed.pop(nmi, None)
-                backfill = state["historical_backfill"]
-                backfill.setdefault("before", {}).pop(nmi, None)
-                backfill.setdefault("failed", {}).pop(nmi, None)
-                state_changed = True
-            for nmi in ignored:
-                target_date = targets[nmi].start
-                last_processed[nmi] = target_date.isoformat()
-                stored_earliest = earliest_processed.get(nmi)
-                target_iso = target_date.isoformat()
-                if stored_earliest is None or target_iso < stored_earliest:
-                    earliest_processed[nmi] = target_iso
-                state_changed = True
-            for nmi, message in batch.no_data.items():
-                target_date = targets[nmi].start
-                waiting.append(nmi)
-                LOGGER.warning(
-                    "SAPN data for NMI %s on %s is not complete; retaining the "
-                    "checkpoint so it will be retried: %s",
-                    nmi,
-                    target_date,
-                    message,
-                )
         else:
-            backfill = state["historical_backfill"]
-            completed = set(backfill.get("completed", []))
-            completed.update(ignored)
-            completed.update(excluded)
-            if ignored or excluded:
-                backfill_progress = True
-                state_changed = True
-            for nmi, message in batch.no_data.items():
-                completed.add(nmi)
-                backfill_progress = True
-                state_changed = True
-                LOGGER.info(
-                    "Historical SAPN data ended before %s for NMI %s: %s",
-                    targets[nmi].end,
-                    nmi,
-                    message,
-                )
-            backfill["completed"] = sorted(completed)
-            if batch.errors:
-                failed = dict(backfill.get("failed", {}))
-                failed.update(batch.errors)
-                backfill["failed"] = failed
-                state_changed = True
+            # Statistics left under this ID by an earlier installation would
+            # otherwise be continued as if this entry had written them.
+            recorder = get_instance(self.hass)
+            recorder.async_clear_statistics([stat_id])
+            await recorder.async_block_till_done()
+            LOGGER.info("SAPN has no history for %s %s yet", nmi, channel)
+        self._streams[stat_id] = stream
 
-        for nmi, streams in batch.streams.items():
-            if nmi in batch.ignored:
+    async def _async_apply(
+        self,
+        stream: Stream,
+        name: str,
+        days: Mapping[date, DaySummary],
+        newest: date | None,
+        latest: date,
+    ) -> None:
+        """Merge newly downloaded days into an imported channel."""
+        start = stream.next_day(latest)
+        points: dict[datetime, float] = {}
+        for day, summary in days.items():
+            if day < start and day not in stream.pending:
                 continue
-            if not streams:
-                errors[nmi] = "No enabled NEM12 channels contained interval data."
-                if mode == "backfill":
-                    state["historical_backfill"].setdefault("failed", {})[nmi] = errors[
-                        nmi
-                    ]
-                    state_changed = True
-                continue
-
-            channels[nmi] = {}
-            statistics[nmi] = {}
-            for channel, stream in streams.items():
-                definition = channel_config[nmi][channel]
-                channels[nmi][channel] = dict(definition)
-                statistics[nmi][channel] = await self._async_import_stream(
-                    nmi,
-                    channel,
-                    stream.points,
-                    mode,
-                    meter_names[nmi],
-                    definition[CONF_CHANNEL_NAME],
-                )
-                queued_statistics = True
-            imported.append(nmi)
-            state_changed = True
-
-            if mode == "forward":
-                target_date = targets[nmi].start
-                last_processed[nmi] = target_date.isoformat()
-                stored_earliest = earliest_processed.get(nmi)
-                target_iso = target_date.isoformat()
-                if stored_earliest is None or target_iso < stored_earliest:
-                    earliest_processed[nmi] = target_iso
+            points.update(summary.points())
+            if summary.final:
+                stream.pending.discard(day)
             else:
-                backfill = state["historical_backfill"]
-                backfill.setdefault("before", {})[nmi] = targets[nmi].start.isoformat()
-                earliest_processed[nmi] = targets[nmi].start.isoformat()
-                backfill["chunks_imported"] = (
-                    int(backfill.get("chunks_imported", 0)) + 1
-                )
-                backfill_progress = True
+                stream.pending.add(day)
+        if days:
+            stream.first = min([*days, *([stream.first] if stream.first else [])])
+            stream.last = max([*days, *([stream.last] if stream.last else [])])
+        if stream.first is not None and newest is not None:
+            # Other channels of this meter have data through ``newest``, so a
+            # day this channel lacks before then is a gap to retry later.
+            stream.pending.update(
+                self._missing_days(days, max(start, stream.first), newest)
+            )
+        self._prune_pending(stream, latest)
+        if points:
+            assert stream.first is not None
+            await async_merge_statistics(
+                self.hass,
+                statistic_metadata(
+                    statistic_id(stream.nmi, stream.channel),
+                    self._statistic_name(stream.nmi, name),
+                ),
+                points,
+                day_start_utc(stream.first),
+            )
 
-        if queued_statistics:
-            await get_instance(self.hass).async_block_till_done()
+    @staticmethod
+    def _missing_days(present: Iterable[date], start: date, through: date) -> set[date]:
+        """Return the days from ``start`` to ``through`` that are not present."""
+        days = {start + timedelta(days=n) for n in range((through - start).days + 1)}
+        return days - set(present)
 
-        if imported:
-            state["last_successful_import"] = {
-                "completed_at": datetime.now(UTC).isoformat(),
-                "type": mode,
-                "dates": requested_dates,
-                "nmis": imported,
-                "meter_names": {nmi: meter_names[nmi] for nmi in imported},
-                "channels": channels,
-                "statistics": statistics,
-            }
+    @staticmethod
+    def _prune_pending(stream: Stream, latest: date) -> None:
+        horizon = latest - timedelta(days=PENDING_RETENTION_DAYS)
+        stream.pending = {
+            day
+            for day in stream.pending
+            if day >= horizon and (stream.first is None or day >= stream.first)
+        }
 
-        if mode == "backfill":
-            backfill = state["historical_backfill"]
-            completed = set(backfill.get("completed", []))
-            failed = set(backfill.get("failed", {}))
-            pending = [nmi for nmi in nmis if nmi not in (completed | failed)]
-            backfill["active"] = bool(pending)
-            if pending and backfill_progress:
-                self._schedule_backfill_refresh()
-            elif not pending and self._unsub_backfill_refresh is not None:
-                self._unsub_backfill_refresh()
-                self._unsub_backfill_refresh = None
-        elif state["historical_backfill"].get("active") and (
-            imported or ignored or excluded
-        ):
-            self._schedule_backfill_refresh()
-        elif imported and self._target_dates(nmis, last_processed, available_day):
-            # A one-time recovery rewind or a long outage can leave several
-            # forward dates queued. Continue at the same bounded cadence used
-            # by historical chunks instead of waiting three hours per day.
-            self._schedule_backfill_refresh()
+    async def _async_pace(self) -> None:
+        """Keep a gap between portal requests."""
+        delay = self._next_request - time.monotonic()
+        if delay > 0:
+            await asyncio.sleep(delay)
+        self._next_request = time.monotonic() + REQUEST_DELAY_SECONDS
 
-        if state_changed or imported:
-            state["last_processed"] = last_processed
-            state["earliest_processed"] = earliest_processed
-            await self._store.async_save(state)
+    async def _async_download(
+        self,
+        client: SAPNClient,
+        nmi: str,
+        first_day: date,
+        last_day: date,
+    ) -> ChannelDays:
+        """Download and summarize a date range, splitting it if SAPN refuses."""
+        try:
+            text = await self._async_request(client, nmi, first_day, last_day)
+            if text is None:
+                return {}
+            return await self.hass.async_add_executor_job(
+                summarize_nem12, text, nmi, first_day, last_day
+            )
+        except SAPNLoginFailedError:
+            raise
+        except (SAPNPortalError, NEM12Error) as err:
+            if first_day >= last_day:
+                raise SAPNPortalError(
+                    f"SAPN data for {nmi} on {first_day} could not be read: {err}"
+                ) from err
+            LOGGER.debug(
+                "Splitting SAPN request for %s %s to %s after: %s",
+                nmi,
+                first_day,
+                last_day,
+                err,
+            )
+        middle = first_day + (last_day - first_day) // 2
+        older = await self._async_download(client, nmi, first_day, middle)
+        newer = await self._async_download(client, nmi, middle + ONE_DAY, last_day)
+        return _merge_days(older, newer)
 
-        if (
-            mode == "forward"
-            and batch.errors
-            and not imported
-            and not waiting
-            and not skipped
-            and not ignored
-            and not excluded
-        ):
-            details = "; ".join(f"{nmi}: {error}" for nmi, error in errors.items())
-            raise UpdateFailed(details)
+    async def _async_request(
+        self,
+        client: SAPNClient,
+        nmi: str,
+        first_day: date,
+        last_day: date,
+    ) -> str | None:
+        """Request NEM12 text, retrying once after a connection problem."""
+        for attempt in range(2):
+            await self._async_pace()
+            try:
+                return await client.download_nem12(nmi, first_day, last_day)
+            except SAPNNoDataError:
+                return None
+            except SAPNConnectionError as err:
+                if attempt:
+                    raise
+                LOGGER.debug("Retrying SAPN request for %s after: %s", nmi, err)
+                await asyncio.sleep(CONNECTION_RETRY_SECONDS)
+        raise AssertionError("unreachable")
 
-        if mode == "backfill" and state["historical_backfill"].get("active"):
-            status = STATUS_BACKFILLING
-        elif errors or waiting or skipped:
-            status = STATUS_PARTIAL if imported else STATUS_ATTENTION
-            if waiting and not errors and not imported and not skipped:
-                status = STATUS_WAITING
-        else:
-            status = STATUS_IMPORTED if imported else STATUS_UP_TO_DATE
+    async def _async_fetch_range(
+        self,
+        client: SAPNClient,
+        nmi: str,
+        first_day: date,
+        last_day: date,
+    ) -> ChannelDays:
+        """Download a date range in chunks, oldest first."""
+        data: ChannelDays = {}
+        chunk_start = first_day
+        while chunk_start <= last_day:
+            chunk_end = min(
+                last_day, chunk_start + timedelta(days=HISTORY_CHUNK_DAYS - 1)
+            )
+            _merge_days(
+                data,
+                await self._async_download(client, nmi, chunk_start, chunk_end),
+            )
+            chunk_start = chunk_end + ONE_DAY
+        return data
 
-        base_result.update(
-            {
-                "status": status,
-                "imported": imported,
-                "waiting": waiting,
-                "waiting_details": dict(batch.no_data),
-                "skipped": skipped,
-                "ignored": ignored,
-                "excluded": sorted(excluded_nmis),
-                "excluded_meters": {
-                    nmi: {
-                        "name": meter_names.get(nmi, nmi),
-                        "meter_type": meter_type,
-                    }
-                    for nmi, meter_type in excluded_nmis.items()
-                },
-                "errors": errors,
-                "channels": channels,
-                "statistics": statistics,
-                "meter_names": {
-                    nmi: meter_names[nmi]
-                    for nmi in configured_nmis
-                    if nmi not in excluded_nmis
-                },
-                "channel_config": {
-                    nmi: definitions
-                    for nmi, definitions in channel_config.items()
-                    if nmi not in excluded_nmis
-                },
-                "name_discovery_error": batch.assignment_error,
-                "last_processed": dict(last_processed),
-                "earliest_processed": dict(earliest_processed),
-                "historical_backfill": self._backfill_snapshot(state),
-                "last_successful_import": state.get("last_successful_import"),
-            }
-        )
-        return base_result
+    async def _async_fetch_history(
+        self,
+        client: SAPNClient,
+        nmi: str,
+        latest: date,
+    ) -> ChannelDays:
+        """Download a meter's history, newest first, until it runs out."""
+        data: ChannelDays = {}
+        earliest = latest - timedelta(days=HISTORY_MAX_DAYS - 1)
+        end = latest
+        empty_days = 0
+        error: SAPNPortalError | None = None
+        while end >= earliest and empty_days < HISTORY_EMPTY_DAYS:
+            start = max(earliest, end - timedelta(days=HISTORY_CHUNK_DAYS - 1))
+            try:
+                chunk = await self._async_download(client, nmi, start, end)
+            except SAPNLoginFailedError:
+                raise
+            except SAPNPortalError as err:
+                LOGGER.debug("Skipping SAPN history %s to %s: %s", start, end, err)
+                error, chunk = err, {}
+            if any(chunk.values()):
+                _merge_days(data, chunk)
+                empty_days = 0
+            else:
+                empty_days += (end - start).days + 1
+            end = start - ONE_DAY
+        if not data and error is not None:
+            raise error
+        return data

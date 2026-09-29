@@ -1,159 +1,157 @@
-"""Pure helpers for SA Power Networks external statistics."""
+"""Write SAPN hourly energy into Home Assistant external statistics.
+
+The recorder holds each hour's energy as the row ``state`` and a running
+total as ``sum``. Every write recomputes ``sum`` from the last row before the
+earliest changed hour through to the newest row, so late or corrected data
+never leaves the running total inconsistent.
+"""
 
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
-from datetime import datetime, timedelta
-from typing import Any
+from collections.abc import Mapping
+from datetime import UTC, datetime, timedelta
 
+from homeassistant.components.recorder import get_instance
+from homeassistant.components.recorder.models import (
+    StatisticData,
+    StatisticMeanType,
+    StatisticMetaData,
+)
+from homeassistant.components.recorder.statistics import (
+    async_add_external_statistics,
+    get_last_statistics,
+    statistics_during_period,
+)
+from homeassistant.const import UnitOfEnergy
+from homeassistant.core import HomeAssistant
 
-@dataclass(frozen=True, slots=True)
-class HourlyPoint:
-    """Energy recorded during one UTC-aligned hour."""
+from .const import DOMAIN
+from .series import build_rows
 
-    start: datetime
-    value: float
-
-
-@dataclass(frozen=True, slots=True)
-class HourlyStream:
-    """An hourly energy stream and the channels that contributed to it."""
-
-    points: tuple[HourlyPoint, ...]
-    channels: tuple[str, ...]
+# How far before a changed hour to look for the row that anchors the sum.
+# A longer search is only needed after a gap of more than this.
+ANCHOR_SEARCH = timedelta(days=90)
+WRITE_BATCH = 2000
 
 
 def statistic_id(nmi: str, channel: str) -> str:
-    """Return a stable NMI/channel Home Assistant external statistic ID."""
-    safe_nmi = re.sub(r"[^a-z0-9_]", "_", str(nmi).lower()).strip("_")
-    safe_channel = re.sub(r"[^a-z0-9_]", "_", str(channel).lower()).strip("_")
-    return f"sapnmeterdata:{safe_nmi}_{safe_channel}"
+    """Return the external statistic ID for one meter channel."""
+    safe_nmi = re.sub(r"[^a-z0-9]+", "_", nmi.lower()).strip("_")
+    safe_channel = re.sub(r"[^a-z0-9]+", "_", channel.lower()).strip("_")
+    return f"{DOMAIN}:{safe_nmi}_{safe_channel}"
 
 
-def statistic_name(
-    nmi: str,
-    channel: str,
-    friendly_name: str | None = None,
-    channel_name: str | None = None,
-) -> str:
-    """Return a user-facing name for one meter channel."""
-    meter_name = friendly_name.strip() if friendly_name else str(nmi)
-    label = channel_name.strip() if channel_name else str(channel)
-    return f"SAPN {meter_name} {label}"
+def statistic_metadata(stat_id: str, name: str) -> StatisticMetaData:
+    """Return metadata for an hourly kWh statistic with a running sum."""
+    return {
+        "has_sum": True,
+        "mean_type": StatisticMeanType.NONE,
+        "name": name,
+        "source": DOMAIN,
+        "statistic_id": stat_id,
+        "unit_class": "energy",
+        "unit_of_measurement": UnitOfEnergy.KILO_WATT_HOUR,
+    }
 
 
-def _row_timestamp(row: Mapping[str, Any]) -> float | None:
-    """Return a statistics row timestamp in Unix seconds."""
-    value = row.get("start")
-    if isinstance(value, datetime):
-        return value.timestamp()
-    if isinstance(value, (int, float)):
-        return float(value)
-    return None
+def _row_start(row: Mapping) -> datetime:
+    start = row["start"]
+    if isinstance(start, datetime):
+        return start.astimezone(UTC)
+    return datetime.fromtimestamp(start, UTC)
 
 
-def derive_base_sum(
-    points: Iterable[HourlyPoint],
-    existing_rows: Iterable[Mapping[str, Any]],
-    last_rows: Iterable[Mapping[str, Any]],
-) -> tuple[float, bool]:
-    """Find the cumulative sum immediately before a forward import."""
-    point_list = tuple(points)
-    cumulative = 0.0
-    existing = tuple(existing_rows)
-    for point in point_list:
-        cumulative += point.value
-        point_timestamp = point.start.timestamp()
-        for row in existing:
-            row_timestamp = _row_timestamp(row)
-            row_sum = row.get("sum")
-            if (
-                row_timestamp is not None
-                and abs(row_timestamp - point_timestamp) < 0.5
-                and isinstance(row_sum, (int, float))
-            ):
-                return float(row_sum) - cumulative, False
-
-    usable_last_rows = [
-        row
-        for row in last_rows
-        if _row_timestamp(row) is not None and isinstance(row.get("sum"), (int, float))
-    ]
-    if usable_last_rows:
-        latest = max(usable_last_rows, key=lambda row: _row_timestamp(row) or 0.0)
-        return float(latest["sum"]), False
-
-    return 0.0, True
-
-
-def derive_prepend_base_sum(
-    points: Iterable[HourlyPoint],
-    existing_rows: Iterable[Mapping[str, Any]],
-    next_rows: Iterable[Mapping[str, Any]],
-) -> float:
-    """Find a base which joins older rows to the first newer statistic.
-
-    Existing rows make a retried chunk deterministic. Otherwise, the final
-    cumulative value in the historical chunk is joined to the cumulative
-    value immediately before the next hourly statistic.
-    """
-    point_list = tuple(points)
-    existing = tuple(existing_rows)
-    if existing:
-        return derive_base_sum(point_list, existing, [])[0]
-
-    total = sum(point.value for point in point_list)
-    usable_next_rows = [
-        row
-        for row in next_rows
-        if _row_timestamp(row) is not None and isinstance(row.get("sum"), (int, float))
-    ]
-    if not usable_next_rows:
-        return 0.0
-
-    next_row = min(usable_next_rows, key=lambda row: _row_timestamp(row) or 0.0)
-    next_sum = float(next_row["sum"])
-    next_state = next_row.get("state")
-    boundary_sum = (
-        next_sum - float(next_state)
-        if isinstance(next_state, (int, float))
-        else next_sum
+async def _async_rows(
+    hass: HomeAssistant,
+    stat_id: str,
+    start: datetime,
+    end: datetime | None,
+) -> list[Mapping]:
+    result = await get_instance(hass).async_add_executor_job(
+        statistics_during_period,
+        hass,
+        start,
+        end,
+        {stat_id},
+        "hour",
+        None,
+        {"state", "sum"},
     )
-    return boundary_sum - total
+    return list(result.get(stat_id, []))
 
 
-def build_statistics(
-    points: Iterable[HourlyPoint],
-    base_sum: float,
-    include_baseline: bool,
-) -> list[dict[str, Any]]:
-    """Build hourly state values and a continuous cumulative sum."""
-    point_list = tuple(points)
-    if not point_list:
-        return []
-
-    rows: list[dict[str, Any]] = []
-    if include_baseline:
-        rows.append(
-            {
-                "start": point_list[0].start - timedelta(hours=1),
-                "state": 0.0,
-                "sum": float(base_sum),
-                "last_reset": None,
-            }
+async def _async_write(
+    hass: HomeAssistant,
+    metadata: StatisticMetaData,
+    rows: list[tuple[datetime, float, float]],
+) -> None:
+    for index in range(0, len(rows), WRITE_BATCH):
+        async_add_external_statistics(
+            hass,
+            metadata,
+            [
+                StatisticData(start=start, state=state, sum=total)
+                for start, state, total in rows[index : index + WRITE_BATCH]
+            ],
         )
+    await get_instance(hass).async_block_till_done()
 
-    running_sum = float(base_sum)
-    for point in point_list:
-        running_sum += point.value
-        rows.append(
-            {
-                "start": point.start,
-                "state": point.value,
-                "sum": running_sum,
-                "last_reset": None,
-            }
-        )
-    return rows
+
+async def async_replace_statistics(
+    hass: HomeAssistant,
+    metadata: StatisticMetaData,
+    points: Mapping[datetime, float],
+) -> None:
+    """Delete a statistic and write ``points`` as its complete history."""
+    recorder = get_instance(hass)
+    recorder.async_clear_statistics([metadata["statistic_id"]])
+    await recorder.async_block_till_done()
+    await _async_write(hass, metadata, build_rows(0.0, points))
+
+
+async def async_merge_statistics(
+    hass: HomeAssistant,
+    metadata: StatisticMetaData,
+    points: Mapping[datetime, float],
+    history_start: datetime,
+) -> None:
+    """Add or replace hours and keep the running sum consistent.
+
+    ``history_start`` is the first hour this statistic has ever held, which
+    bounds the search for the row before the earliest changed hour.
+    """
+    if not points:
+        return
+    stat_id = metadata["statistic_id"]
+    first = min(points)
+
+    last = await get_instance(hass).async_add_executor_job(
+        get_last_statistics, hass, 1, stat_id, True, {"sum"}
+    )
+    last_rows = last.get(stat_id, [])
+    if not last_rows:
+        await _async_write(hass, metadata, build_rows(0.0, points))
+        return
+    if _row_start(last_rows[0]) < first:
+        # Common case: appending newer hours after everything stored.
+        base = float(last_rows[0].get("sum") or 0.0)
+        await _async_write(hass, metadata, build_rows(base, points))
+        return
+
+    # New or corrected hours overlap stored ones. Rebuild every row from the
+    # first changed hour onwards, anchored on the row just before it.
+    search_start = max(first - ANCHOR_SEARCH, history_start)
+    stored = await _async_rows(hass, stat_id, search_start, None)
+    before = [row for row in stored if _row_start(row) < first]
+    if not before and search_start > history_start:
+        before = await _async_rows(hass, stat_id, history_start, first)
+    base = float(before[-1].get("sum") or 0.0) if before else 0.0
+
+    states = {
+        _row_start(row): float(row.get("state") or 0.0)
+        for row in stored
+        if _row_start(row) >= first
+    }
+    states.update(points)
+    await _async_write(hass, metadata, build_rows(base, states))
